@@ -26,12 +26,29 @@ import time
 
 import cv2
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "backend"))
+sys.path.insert(0, os.environ.get("AUTOEXTRACT_BACKEND", os.path.join(HERE, "..", "backend")))
 
 BOX_STATS = ("min", "first_quartile", "median", "third_quartile", "max")
 OUR_STATS = ("lo", "q1", "median", "q3", "hi")
+
+
+def match_by_x(gt_xs, predictions):
+    """Maximize one-to-one overlap matches, then minimize center distance."""
+    if not gt_xs or not predictions:
+        return []
+    n = len(predictions)
+    miss_cost = 1_000_000.0
+    costs = np.full((len(gt_xs), n + len(gt_xs)), 2 * miss_cost)
+    costs[:, n:] = miss_cost
+    for gi, gx in enumerate(gt_xs):
+        for pi, pred in enumerate(predictions):
+            if pred.x1 - 3 <= gx <= pred.x2 + 3:
+                costs[gi, pi] = abs((pred.x1 + pred.x2) / 2 - gx)
+    rows, cols = linear_sum_assignment(costs)
+    return [(int(gi), int(pi)) for gi, pi in zip(rows, cols) if pi < n and costs[gi, pi] < miss_cost]
 
 
 def load_cases(root, chart_type):
@@ -108,14 +125,9 @@ def eval_box(cases, ex, opts, show=None):
         if not boxes or not rng:
             continue
         to_value = cal[0]
-        for g in gt:
-            if "median" not in g:
-                continue
-            gx = g["median"]["x"]
-            near = [b for b in boxes if b.x1 - 3 <= gx <= b.x2 + 3]
-            if not near:
-                continue
-            b = min(near, key=lambda b: abs((b.x1 + b.x2) / 2 - gx))
+        eligible = [g for g in gt if "median" in g]
+        for gi, pi in match_by_x([g["median"]["x"] for g in eligible], boxes):
+            g, b = eligible[gi], boxes[pi]
             n_matched += 1
             errs = []
             for gs, os_ in zip(BOX_STATS, OUR_STATS):
@@ -150,12 +162,8 @@ def eval_bar(cases, ex, opts, show=None):
         if not bars or cal is None:
             continue
         to_value, _, _, rng = cal
-        for g in vis:
-            gx = g["x0"] + g["width"] / 2
-            near = [b for b in bars if b.x1 - 3 <= gx <= b.x2 + 3]
-            if not near:
-                continue
-            b = min(near, key=lambda b: abs((b.x1 + b.x2) / 2 - gx))
+        for gi, pi in match_by_x([g["x0"] + g["width"] / 2 for g in vis], bars):
+            g, b = vis[gi], bars[pi]
             # the bar's value end is its edge away from the baseline: the top
             # for upward bars, the bottom for bars hanging below zero
             top_v, bot_v = to_value(g["y0"]), to_value(g["y0"] + g["height"])
@@ -221,7 +229,9 @@ def summarise(label, rows, found, n_charts, n_gt, n_matched, stat_names):
         col = E[:, j][~np.isnan(E[:, j])]
         if col.size:
             print(f"  {s:>8s}: median {np.median(col):.2f}%  p90 {np.percentile(col, 90):.2f}%  "
-                  f"<1%: {100 * (col < 1).mean():.0f}%  <2%: {100 * (col < 2).mean():.0f}%  <5%: {100 * (col < 5).mean():.0f}%")
+                  f"<1% matched: {100 * (col < 1).mean():.0f}%  "
+                  f"<1% all GT: {100 * (col < 1).sum() / max(n_gt, 1):.0f}%  "
+                  f"<2%: {100 * (col < 2).mean():.0f}%  <5%: {100 * (col < 5).mean():.0f}%")
 
 
 def main():

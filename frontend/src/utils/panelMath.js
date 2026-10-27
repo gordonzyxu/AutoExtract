@@ -96,8 +96,8 @@ export const WHISKER_TYPES = [
     { key: 'unknown', label: 'Not stated', hint: 'Only the quartiles are used (safest)' },
 ];
 export const VIOLIN_ENDS = [
-    { key: 'minmax', label: 'Data min–max', hint: 'Trimmed violins end at the smallest and largest value (Prism and ggplot default)' },
-    { key: 'unknown', label: 'Not the range', hint: 'The tails extend past the data: only the quartiles are used' },
+    { key: 'unknown', label: 'Not confirmed', hint: 'The density tails may extend past the data; only drawn quartiles are used' },
+    { key: 'minmax', label: 'Data min–max', hint: 'Choose only when the figure or caption confirms trimmed ends' },
 ];
 export const MEAN_METHODS = [
     { key: 'luo', label: 'Luo 2018', hint: 'Recommended' },
@@ -158,7 +158,7 @@ export const estimateBox = (box, panel) => {
     const n = Number(box.n) || 0;
     const meanM = panel.mean_method || 'luo';
     const sdM = panel.sd_method || 'shi';
-    const range = (panel.whisker_type || 'minmax') === 'minmax' && a != null && b != null;
+    const range = panel.whisker_type === 'minmax' && a != null && b != null;
     if (m == null || n < 2) return { mean: null, sd: null };
     if (q1 == null || q3 == null) {
         // S1: min, median, max (a violin showing only its median)
@@ -234,7 +234,7 @@ export const boxRow = (box, panel, paperId) => {
         'depression_model_duration': '',
         'paper_id': paperId ?? '',
         'sem': sd != null && n ? sd / Math.sqrt(n) : '',
-        'mean+sem': mean != null && sd != null ? mean + sd : '',
+        'mean+sem': mean != null && sd != null && n ? mean + sd / Math.sqrt(n) : '',
     };
 };
 

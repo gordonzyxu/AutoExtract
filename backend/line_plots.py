@@ -89,19 +89,31 @@ def _colour_groups(region: np.ndarray, ink: np.ndarray) -> List[Tuple[np.ndarray
         # peaks of the hue histogram, merged with their neighbours
         thresh = max(15, 0.01 * colour.sum())
         used = np.zeros(36, bool)
+        hb = (hue // 10).astype(int) % 36
+        bin_chroma = np.zeros(36)
+        for k in np.where(hist > 0)[0]:
+            bin_chroma[k] = np.median(chroma[colour & (hb == k)])
+
+        def joins(k, p):
+            # A neighbouring hue bin is the same series when it is well
+            # populated, or when it is a sparse, paler bin: the anti-aliased
+            # fringe of a saturated line shifts hue slightly as it fades.
+            return not used[k] and (hist[k] >= 0.15 * hist[p] or
+                                    (abs((k - p + 18) % 36 - 18) == 1 and hist[k] >= 0.02 * hist[p]
+                                     and bin_chroma[k] < 0.8 * bin_chroma[p]))
+
         for _ in range(8):
             cand = np.where(~used & (hist >= thresh))[0]
             if cand.size == 0:
                 break
             p = cand[np.argmax(hist[cand])]
             lo = hi = p
-            while hist[(lo - 1) % 36] >= 0.15 * hist[p] and not used[(lo - 1) % 36] and (p - lo) < 4:
+            while joins((lo - 1) % 36, p) and (p - lo) < 4:
                 lo -= 1
-            while hist[(hi + 1) % 36] >= 0.15 * hist[p] and not used[(hi + 1) % 36] and (hi - p) < 4:
+            while joins((hi + 1) % 36, p) and (hi - p) < 4:
                 hi += 1
             bins = [(k % 36) for k in range(lo, hi + 1)]
             used[bins] = True
-            hb = (hue // 10).astype(int) % 36
             m = colour & np.isin(hb, bins)
             if m.sum() > 30:
                 groups.append((m, _mean_bgr(region, m)))
@@ -294,17 +306,17 @@ def _error_bar(mask: np.ndarray, cx: float, cy: float, half: float, step: int, l
     c = int(round(cx))
     if not 0 <= c < w:
         return None
-    y = int(round(cy + step * (half + 1)))
+    y = int(round(cy + step * (min(half, 2 * line_w + 2) + 1)))
     end, gap = None, 0
     while 0 <= y < h:
-        if mask[y, max(0, c - 1):c + 2].any():
+        if mask[y, max(0, c - max(2, line_w)):min(w, c + max(2, line_w) + 1)].any():
             end, gap = y, 0
         else:
             gap += 1
             if gap > max(2, line_w):
                 break
         y += step
-    if end is None or abs(end - cy) <= half + line_w + 2:
+    if end is None or abs(end - cy) <= max(half + line_w, 3):
         return None
     # a cap: a horizontal run at the end, wider than the stroke, centred
     best = None
@@ -343,7 +355,18 @@ def _frames_and_references(mask: np.ndarray, line_w: int) -> np.ndarray:
             if e - s + 1 > thick:
                 continue
             band = m[s:e + 1].any(axis=0)
-            runs = _runs1d(band)
+            # A dash lies within the band; a series crossing the band, or a
+            # marker on it, also has ink just above or below. Without this, a
+            # row where several series cross looks like many dashes.
+            above = m[max(0, s - 2)] if s >= 2 else np.zeros_like(band)
+            below = m[e + 2] if e + 2 < m.shape[0] else np.zeros_like(band)
+            runs = [(a, b) for a, b in _runs1d(band)
+                    if (above[a:b + 1] | below[a:b + 1]).mean() < 0.5]
+            if len(runs) < 5:
+                continue
+            band = np.zeros_like(band)
+            for a, b in runs:
+                band[a:b + 1] = True
             span = np.where(band)[0]
             # dashes repeat: similar lengths at similar spacing (error bars and
             # markers stacked in one column do not)
@@ -449,11 +472,22 @@ def find_series(image: np.ndarray, ink: np.ndarray, dark: np.ndarray, x_lo: int,
                     if yl is not None and abs(yl - cy) <= 0.6 * mw:
                         cy = yl
                     p = LinePoint(x_px=x0 + cx, y_px=y_lo + cy)
-                    # error bars in the series colour, else in black
-                    for m in (mask, dark[y_lo:y_hi, x0:x_hi + 1].astype(bool)):
-                        hi = _error_bar(m, cx, cy, mw / 2.0, -1, line_w)
-                        lo = _error_bar(m, cx, cy, mw / 2.0, +1, line_w)
+                    # Morphology can merge a marker with its horizontal error
+                    # caps, making its apparent width much larger than the
+                    # marker itself. Start the cap trace inside that blob so
+                    # short but visible whiskers are not skipped outright.
+                    search_half = min(mw / 2.0, max(4.0, 3.0 * line_w + 4.0))
+                    # Coloured series may have black error bars. A black or
+                    # grey series must use its own mask: the combined dark
+                    # mask can contain another series' cap at the same x.
+                    cap_masks = [mask]
+                    if max(colour) - min(colour) > 20:
+                        cap_masks.append(dark[y_lo:y_hi, x0:x_hi + 1].astype(bool))
+                    for m in cap_masks:
+                        hi = _error_bar(m, cx, cy, search_half, -1, line_w)
+                        lo = _error_bar(m, cx, cy, search_half, +1, line_w)
                         if hi is not None or lo is not None:
+                            p._cap_from_dark = m is not mask
                             p.cap_hi_px = y_lo + hi if hi is not None else None
                             p.cap_lo_px = y_lo + lo if lo is not None else None
                             # bars are drawn both ways; one side alone (or two
@@ -498,6 +532,13 @@ def line_y_at(path: np.ndarray, cx: float, half: float, marker_xs=()) -> Optiona
 
 
 def _same_trace(a: Series, b: Series, line_w: int) -> bool:
-    xs = [p[0] for p in a.trace]
-    d = [abs(a.y_at(x) - b.y_at(x)) for x in xs if b.y_at(x) is not None]
-    return len(d) > 0.6 * len(xs) and float(np.median(d)) <= 2 * line_w + 1
+    if not a.trace or not b.trace:
+        return False
+    a_points = np.asarray(a.trace, dtype=float)
+    b_points = np.asarray(b.trace, dtype=float)
+    inside = ((a_points[:, 0] >= b_points[0, 0] - 2) &
+              (a_points[:, 0] <= b_points[-1, 0] + 2))
+    if inside.sum() <= 0.6 * len(a.trace):
+        return False
+    y_b = np.interp(a_points[inside, 0], b_points[:, 0], b_points[:, 1])
+    return float(np.median(np.abs(a_points[inside, 1] - y_b))) <= 2 * line_w + 1

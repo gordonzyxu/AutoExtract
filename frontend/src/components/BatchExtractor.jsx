@@ -2,8 +2,8 @@
  * BatchExtractor Component
  *
  * Drop in papers (PDF) or figure images, several at once; every chart of the
- * page's kind is measured automatically: bar charts and dot plots on the Bar
- * Analyzer page, box plots on the Box Analyzer page. Review and adjust each
+ * page's kind is measured automatically: bars, mean-and-whisker dots, boxes,
+ * violins, or lines. Review and adjust each
  * panel, then download one workbook in the meta-analysis long format or copy
  * rows to the clipboard.
  */
@@ -33,6 +33,18 @@ const MODES = {
         defaults: { bar_names: true, titles: true, legend_colors: false },
         errorType: true,
         file: 'bar_charts.xlsx',
+    },
+    dot: {
+        title: 'Dot Plot Analyzer',
+        intro: 'Drop papers (PDF) or figure images, as many as you like. Mean-and-whisker dot plots are measured automatically: each group mean and error bar is read from the pixels.',
+        noun: 'dot plots',
+        options: [
+            { key: 'bar_names', label: 'Group names', hint: 'Read category labels under each dot group (fast)' },
+            { key: 'titles', label: 'Panel letters & axis titles', hint: 'Name each sheet (fast)' },
+        ],
+        defaults: { bar_names: true, titles: true },
+        errorType: true,
+        file: 'dot_plots.xlsx',
     },
     box: {
         title: 'Box Analyzer',
@@ -74,7 +86,7 @@ const MODES = {
     },
 };
 
-const ITEM_NOUN = { bar: 'bars', box: 'boxes', violin: 'violins', line: 'points' };
+const ITEM_NOUN = { bar: 'bars', dot: 'groups', box: 'boxes', violin: 'violins', line: 'points' };
 const EDITORS = { box: BoxPanelEditor, violin: BoxPanelEditor, line: LinePanelEditor };
 
 const settingsKey = (mode) => `analyzer.${mode}.settings.v1`;

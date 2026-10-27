@@ -71,7 +71,7 @@ def _sheet_title(base: str, used: set) -> str:
     return candidate
 
 
-BOX_COLUMNS = ["min", "Q1", "median", "Q3", "max", "whiskers", "mean method", "sd method"]
+BOX_COLUMNS = ["lower end", "Q1", "median", "Q3", "upper end", "whiskers", "mean method", "sd method"]
 
 
 def long_header(error_type: str) -> List[str]:

@@ -66,7 +66,7 @@ def scenario_for(whisker_type: str, quartiles: bool = True) -> Optional[str]:
 
 def estimate(q1: Optional[float], median: float, q3: Optional[float], n: Optional[float],
              minimum: Optional[float] = None, maximum: Optional[float] = None,
-             whisker_type: str = "minmax", mean_method: str = "luo",
+             whisker_type: str = "unknown", mean_method: str = "luo",
              sd_method: str = "shi") -> Estimate:
     """
     Mean and SD from box statistics. Needs n (all modern estimators depend on

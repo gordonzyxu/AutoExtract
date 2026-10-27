@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 
+import cv2
 import numpy as np
 import pytest
 from scipy.stats import norm
@@ -51,6 +52,28 @@ CASES = {
 }
 
 
+def test_capless_dashed_whisker_end_is_flagged_for_review(extractor):
+    from fuzz import random_box_spec
+
+    rng = np.random.default_rng(7)
+    for _ in range(47):
+        spec = random_box_spec(rng)
+    assert spec.dashed and not spec.caps
+    panels = extractor.extract(render_box(spec), FAST)
+    assert len(panels) == 1 and len(panels[0].boxes) == 2
+    assert all(b.uncertain and "dashed whisker" in b.note for b in panels[0].boxes)
+    span = spec.ylim[1] - spec.ylim[0]
+    assert abs(panels[0].boxes[0].q1 - spec.stats[0][1]) / span < 0.01
+    assert abs(panels[0].boxes[0].q3 - spec.stats[0][3]) / span < 0.01
+
+
+def test_box_whisker_semantics_are_unconfirmed_until_selected(extractor):
+    panel = extractor.extract(render_box(CASES["white"]), FAST)[0]
+    assert panel.whisker_type == "unknown"
+    assert estimate(3, 4, 6, 20, 1, 9).scenario == "S3"
+    assert estimate(3, 4, 6, 20, 1, 9, "minmax").scenario == "S2"
+
+
 @pytest.mark.parametrize("name", sorted(CASES))
 def test_box_values(extractor, name):
     spec = CASES[name]
@@ -88,6 +111,46 @@ def test_box_page_ignores_bar_charts(extractor):
                  ChartSpec([80, 40, 75, 55], [4, 3, 5, 4], dots=True, seed=3),
                  ChartSpec([110, 170, 126], [44, 52, 35], kind="dot", dots=True, ylim=(0, 300))):
         assert extractor.extract(render(spec), FAST) == []
+
+
+def test_box_plot_with_vertical_axis_only(extractor):
+    spec = BoxSpec(STATS4[:2], ylim=(0, 20))
+    image = render_box(spec)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    ink = ((gray < 235) | (hsv[:, :, 1] > 40)).astype(np.uint8)
+    axis = extractor._find_axes((gray < 128).astype(np.uint8), ink)[0]
+    y = round(axis["axis_y"])
+    image[y - 2:y + 3, axis["axis_left"] + 3:axis["right"] + 2] = 255
+    panels = extractor.extract(image, FAST)
+    assert len(panels) == 1 and len(panels[0].boxes) == 2
+    for box, stats in zip(panels[0].boxes, spec.stats):
+        assert abs(box.median - stats[2]) < 0.2
+
+
+def test_dark_fill_quartile_edges_at_low_resolution(extractor):
+    spec = BoxSpec([(2, 4, 6, 8, 10)], colors=["#222244"], dpi=110, ylim=(0, 12))
+    panel = extractor.extract(render_box(spec), FAST)[0]
+    box = panel.boxes[0]
+    assert abs(box.q1 - 4) < 0.06
+    assert abs(box.q3 - 8) < 0.06
+
+
+@pytest.mark.parametrize("case_index", [25, 28])
+def test_resized_box_outline_and_whiskers(extractor, case_index):
+    """Compressed outlines must not hide a box or turn its edge into a cap."""
+    from fuzz import image_variant, random_box_spec
+
+    rng = np.random.default_rng(123)
+    for _ in range(case_index + 1):
+        spec = random_box_spec(rng)
+    image = image_variant(render_box(spec), jpeg_quality=65, resize_factor=0.75)
+    panels = extractor.extract(image, FAST)
+    assert len(panels) == 1 and len(panels[0].boxes) == len(spec.stats)
+    span = spec.ylim[1] - spec.ylim[0]
+    for box, expected in zip(panels[0].boxes, spec.stats):
+        for got, want in zip((box.lo, box.q1, box.median, box.q3, box.hi), expected):
+            assert got is not None and abs(got - want) / span < 0.01
 
 
 def test_bar_page_ignores_box_plots(extractor):

@@ -77,11 +77,6 @@ def handle_extract() -> Tuple[Dict[str, Any], int]:
     job = request.form.get("job") or uuid.uuid4().hex
     if not job.isalnum():
         return {"error": "Invalid job id"}, 400
-    if not request.form.get("job"):
-        _clean_old_jobs()
-    job_dir = os.path.join(JOBS_DIR, job)
-    os.makedirs(job_dir, exist_ok=True)
-
     try:
         options = ExtractOptions.from_dict(json.loads(request.form.get("options") or "{}"))
     except (ValueError, TypeError):
@@ -89,6 +84,11 @@ def handle_extract() -> Tuple[Dict[str, Any], int]:
     error_type = request.form.get("error_type") or None
     if error_type not in (None, "sem", "sd"):
         return {"error": "error_type must be 'sem' or 'sd'"}, 400
+
+    if not request.form.get("job"):
+        _clean_old_jobs()
+    job_dir = os.path.join(JOBS_DIR, job)
+    os.makedirs(job_dir, exist_ok=True)
 
     fd, tmp = tempfile.mkstemp(suffix="." + ext)
     os.close(fd)
@@ -155,7 +155,7 @@ def handle_export():
                 if panel.error_type not in ("sem", "sd"):
                     panel.error_type = "sem"
                 if panel.whisker_type not in WHISKER_TYPES:
-                    panel.whisker_type = "minmax"
+                    panel.whisker_type = "unknown"
                 if panel.mean_method not in MEAN_METHODS:
                     panel.mean_method = "luo"
                 if panel.sd_method not in SD_METHODS:

@@ -1,11 +1,12 @@
 """
 Randomised stress test: many synthetic charts with random values and styles.
 
-    .venv/Scripts/python tests/fuzz.py [N] [--seed S] [--show-failures DIR] [--box | --violin | --line]
+    .venv/Scripts/python tests/fuzz.py [N] [--seed S] [--show-failures DIR] [--dot | --box | --violin | --line]
 
 Reports detection rate and error distribution; failures can be saved as
-images for inspection. Exit code 1 if fewer than 95% of charts are measured
-with every mean within 1% of the axis range (--box: every box statistic).
+images for inspection. The bar/dot chart pass criterion checks means and group
+count; cap errors are reported separately because uncertain caps need review.
+Exit code 1 if fewer than 95% of charts pass.
 """
 
 from __future__ import annotations
@@ -17,9 +18,10 @@ import time
 
 import cv2
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "backend"))
+sys.path.insert(0, os.environ.get("AUTOEXTRACT_BACKEND", os.path.join(HERE, "..", "backend")))
 sys.path.insert(0, HERE)
 
 from figure_extractor import ExtractOptions, FigureExtractor  # noqa: E402
@@ -33,10 +35,23 @@ PALETTES = [
 ]
 
 
-def random_spec(rng: np.random.Generator) -> ChartSpec:
+def image_variant(img: np.ndarray, jpeg_quality: int | None, resize_factor: float) -> np.ndarray:
+    """Simulate a resized screenshot or a lossy chart image."""
+    if resize_factor != 1:
+        method = cv2.INTER_AREA if resize_factor < 1 else cv2.INTER_CUBIC
+        img = cv2.resize(img, None, fx=resize_factor, fy=resize_factor, interpolation=method)
+    if jpeg_quality is not None:
+        ok, encoded = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+        if not ok:
+            raise RuntimeError("JPEG encoding failed")
+        img = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    return img
+
+
+def random_spec(rng: np.random.Generator, kind_override: str | None = None) -> ChartSpec:
     n = int(rng.integers(2, 9))
     scale = float(10.0 ** rng.integers(-1, 4))
-    kind = "dot" if rng.random() < 0.15 else "bar"
+    kind = kind_override or ("dot" if rng.random() < 0.15 else "bar")
     negative = kind == "bar" and rng.random() < 0.12
     means = rng.uniform(0.15, 1.0, n) * scale
     if negative:
@@ -84,13 +99,16 @@ def random_box_spec(rng: np.random.Generator) -> BoxSpec:
     )
 
 
-def fuzz_boxes(n: int, rng, ex, opts, show) -> int:
+def fuzz_boxes(n: int, rng, ex, opts, show, jpeg_quality=None, resize_factor=1) -> int:
     ok, errs, failures = 0, [], []
+    scan_ms = []
     t0 = time.time()
     for i in range(n):
         spec = random_box_spec(rng)
-        img = render_box(spec)
+        img = image_variant(render_box(spec), jpeg_quality, resize_factor)
+        scan_start = time.perf_counter()
         panels = ex.extract(img, opts)
+        scan_ms.append(1000 * (time.perf_counter() - scan_start))
         reason = None
         if len(panels) != 1 or panels[0].kind != "box":
             reason = f"{len(panels)} panels" + (f" ({panels[0].kind})" if panels else "")
@@ -113,6 +131,7 @@ def fuzz_boxes(n: int, rng, ex, opts, show) -> int:
                 cv2.imwrite(os.path.join(show, f"box_fail_{i:03d}.png"), img)
     dt = time.time() - t0
     print(f"box plots: {n}  fully correct: {ok} ({100 * ok / n:.1f}%)  time {dt:.1f}s ({1000 * dt / n:.0f} ms/chart)")
+    print(f"extraction only: p50 {np.median(scan_ms):.0f} ms  p95 {np.percentile(scan_ms, 95):.0f} ms")
     if errs:
         e = np.array(errs)
         print(f"stat err: median {np.median(e):.3f}%  p95 {np.percentile(e, 95):.3f}%  max {e.max():.2f}%")
@@ -148,13 +167,16 @@ def random_violin_spec(rng: np.random.Generator) -> ViolinSpec:
     )
 
 
-def fuzz_violins(n: int, rng, ex, opts, show) -> int:
+def fuzz_violins(n: int, rng, ex, opts, show, jpeg_quality=None, resize_factor=1) -> int:
     ok, errs, failures = 0, [], []
+    scan_ms = []
     t0 = time.time()
     for i in range(n):
         spec = random_violin_spec(rng)
-        img = render_violin(spec)
+        img = image_variant(render_violin(spec), jpeg_quality, resize_factor)
+        scan_start = time.perf_counter()
         panels = ex.extract(img, opts)
+        scan_ms.append(1000 * (time.perf_counter() - scan_start))
         reason = None
         if len(panels) != 1 or panels[0].kind != "violin":
             reason = f"{len(panels)} panels"
@@ -167,6 +189,8 @@ def fuzz_violins(n: int, rng, ex, opts, show) -> int:
                 pairs = [(b.lo, st[0]), (b.median, st[2]), (b.hi, st[4])]
                 if spec.inner != "median":
                     pairs += [(b.q1, st[1]), (b.q3, st[3])]
+                elif b.quartiles or b.q1 is not None or b.q3 is not None:
+                    e.append(100.0)  # claiming undrawn quartiles is a false measurement
                 e += [abs(g - w) / span * 100 if g is not None else 100.0 for g, w in pairs]
             errs += e
             if max(e) >= 1:
@@ -180,6 +204,7 @@ def fuzz_violins(n: int, rng, ex, opts, show) -> int:
                 cv2.imwrite(os.path.join(show, f"violin_fail_{i:03d}.png"), img)
     dt = time.time() - t0
     print(f"violin plots: {n}  fully correct: {ok} ({100 * ok / n:.1f}%)  time {dt:.1f}s ({1000 * dt / n:.0f} ms/chart)")
+    print(f"extraction only: p50 {np.median(scan_ms):.0f} ms  p95 {np.percentile(scan_ms, 95):.0f} ms")
     if errs:
         e = np.array(errs)
         print(f"stat err: median {np.median(e):.3f}%  p95 {np.percentile(e, 95):.3f}%  max {e.max():.2f}%")
@@ -213,33 +238,46 @@ def random_line_spec(rng: np.random.Generator) -> LineSpec:
     )
 
 
-def fuzz_lines(n: int, rng, ex, opts, show) -> int:
+def fuzz_lines(n: int, rng, ex, opts, show, jpeg_quality=None, resize_factor=1) -> int:
     """
-    Every series' points: the closest extracted series with the same number
-    of points must put each mean within 1% (error bar within 1.5%) of the
-    axis range. Points flagged for a check (hidden markers) count as found.
+    Match series one-to-one, requiring exact counts and x/y values within 1%
+    of their axis ranges. Measured unflagged caps must be within 1.5%; missing
+    unflagged caps are reported as a separate completeness metric.
     """
-    ok, errs, failures = 0, [], []
+    ok, complete, missing_caps, errs, failures = 0, 0, 0, [], []
+    measured_caps = flagged_caps = flagged_missing_caps = 0
+    scan_ms = []
     t0 = time.time()
     for i in range(n):
         spec = random_line_spec(rng)
-        img = render_line(spec)
+        img = image_variant(render_line(spec), jpeg_quality, resize_factor)
+        scan_start = time.perf_counter()
         panels = ex.extract(img, opts)
+        scan_ms.append(1000 * (time.perf_counter() - scan_start))
         reason = None
+        missing_here = 0
         if len(panels) != 1 or panels[0].kind != "line":
             reason = f"{len(panels)} panels"
         else:
             p = panels[0]
             span = spec.ylim[1] - spec.ylim[0]
-            for k, ys in enumerate(spec.ys):
-                cands = [s for s in p.series if len(s.points) == len(ys)]
-                if not cands:
-                    reason = f"series {k + 1}: no series with {len(ys)} points " \
-                             f"({[len(s.points) for s in p.series]})"
+            matches = match_line_series(spec, p.series)
+            if matches is None:
+                reason = f"series mismatch: expected {len(spec.ys)} x {len(spec.x)} points, got " \
+                         f"{[len(s.points) for s in p.series]}"
+            for k, s in enumerate(matches or []):
+                ys = spec.ys[k]
+                if any(pt.mean is None or pt.x is None for pt in s.points):
+                    reason = f"series {k + 1}: uncalibrated point"
                     break
-                s = min(cands, key=lambda s: np.mean([abs(pt.mean - y) for pt, y in zip(s.points, ys)]))
                 e = [abs(pt.mean - y) / span * 100 for pt, y in zip(s.points, ys)]
+                e += [abs(pt.x - x) / (max(spec.x) - min(spec.x)) * 100
+                      for pt, x in zip(s.points, spec.x)]
                 if spec.errs:
+                    missing_here += sum(pt.mean_plus_err is None and not pt.uncertain for pt in s.points)
+                    measured_caps += sum(pt.mean_plus_err is not None and not pt.uncertain for pt in s.points)
+                    flagged_caps += sum(pt.mean_plus_err is not None and pt.uncertain for pt in s.points)
+                    flagged_missing_caps += sum(pt.mean_plus_err is None and pt.uncertain for pt in s.points)
                     # error bars flagged for a check count as caught, as for bars
                     e += [abs((pt.mean_plus_err - pt.mean) - er) / span * 100 / 1.5
                           for pt, er in zip(s.points, spec.errs[k])
@@ -250,13 +288,22 @@ def fuzz_lines(n: int, rng, ex, opts, show) -> int:
                     break
         if reason is None:
             ok += 1
+            if not missing_here:
+                complete += 1
         else:
             failures.append((i, spec, reason))
             if show:
                 os.makedirs(show, exist_ok=True)
                 cv2.imwrite(os.path.join(show, f"line_fail_{i:03d}.png"), img)
+        missing_caps += missing_here
     dt = time.time() - t0
-    print(f"line plots: {n}  fully correct: {ok} ({100 * ok / n:.1f}%)  time {dt:.1f}s ({1000 * dt / n:.0f} ms/chart)")
+    print(f"line plots: {n}  value-correct: {ok} ({100 * ok / n:.1f}%)  "
+          f"no unflagged missing caps: {complete} ({100 * complete / n:.1f}%)  "
+          f"missing unflagged caps: {missing_caps}  "
+          f"time {dt:.1f}s ({1000 * dt / n:.0f} ms/chart, including rendering)")
+    print(f"extraction only: p50 {np.median(scan_ms):.0f} ms  p95 {np.percentile(scan_ms, 95):.0f} ms")
+    print(f"caps: {measured_caps} confirmed, {flagged_caps} measured but flagged, "
+          f"{flagged_missing_caps} missing and flagged, {missing_caps} missing and unflagged")
     if errs:
         e = np.array(errs)
         print(f"point err: median {np.median(e):.3f}%  p95 {np.percentile(e, 95):.3f}%  max {e.max():.2f}%")
@@ -264,6 +311,23 @@ def fuzz_lines(n: int, rng, ex, opts, show) -> int:
         print(f"  #{i}: {reason}  series={len(spec.ys)} pts={len(spec.x)} colours={spec.colors} "
               f"markers={spec.markers} hollow={spec.hollow} legend={spec.legend} dpi={spec.dpi}")
     return 0 if ok >= 0.95 * n else 1
+
+
+def match_line_series(spec: LineSpec, series):
+    """Find a one-to-one match, rejecting missing or extra series/points."""
+    if len(series) != len(spec.ys) or any(len(s.points) != len(spec.x) for s in series):
+        return None
+    xspan = max(spec.x) - min(spec.x)
+    yspan = spec.ylim[1] - spec.ylim[0]
+    cost = np.array([
+        [np.mean([(abs(pt.mean - y) / yspan + abs(pt.x - x) / xspan)
+                  if pt.mean is not None and pt.x is not None else 100
+                  for pt, x, y in zip(s.points, spec.x, ys)])
+         for s in series]
+        for ys in spec.ys
+    ])
+    rows, cols = linear_sum_assignment(cost)
+    return [series[cols[k]] for k in rows]
 
 
 def main() -> int:
@@ -274,29 +338,46 @@ def main() -> int:
     ap.add_argument("--box", action="store_true", help="random box plots instead of bar charts")
     ap.add_argument("--violin", action="store_true", help="random violin plots")
     ap.add_argument("--line", action="store_true", help="random line plots")
+    ap.add_argument("--dot", action="store_true", help="random dot/mean-and-whisker plots only")
+    ap.add_argument("--bar-only", action="store_true", help="random bars only (default mixes bars and dots)")
+    ap.add_argument("--jpeg-quality", type=int, default=None, help="JPEG round-trip at quality 1-100")
+    ap.add_argument("--resize-factor", type=float, default=1, help="rescale before extraction, e.g. 0.5")
     args = ap.parse_args()
+    if args.jpeg_quality is not None and not 1 <= args.jpeg_quality <= 100:
+        ap.error("--jpeg-quality must be between 1 and 100")
+    if args.resize_factor <= 0:
+        ap.error("--resize-factor must be positive")
+    if sum((args.box, args.violin, args.line, args.dot, args.bar_only)) > 1:
+        ap.error("choose only one chart type")
     rng = np.random.default_rng(args.seed)
     ex = FigureExtractor()
     opts = ExtractOptions(bar_names=False, titles=False)
     if args.box:
         opts.chart_type = "box"
-        return fuzz_boxes(args.n, rng, ex, opts, args.show_failures)
+        return fuzz_boxes(args.n, rng, ex, opts, args.show_failures, args.jpeg_quality, args.resize_factor)
     if args.violin:
         opts.chart_type = "violin"
-        return fuzz_violins(args.n, rng, ex, opts, args.show_failures)
+        return fuzz_violins(args.n, rng, ex, opts, args.show_failures, args.jpeg_quality, args.resize_factor)
     if args.line:
         opts.chart_type = "line"
-        return fuzz_lines(args.n, rng, ex, opts, args.show_failures)
+        return fuzz_lines(args.n, rng, ex, opts, args.show_failures, args.jpeg_quality, args.resize_factor)
+    if args.dot:
+        opts.chart_type = "dot"
     ok = 0
     mean_errs, cap_errs, flagged, failures = [], [], 0, []
+    scan_ms = []
     t0 = time.time()
     for i in range(args.n):
-        spec = random_spec(rng)
-        img = render(spec)
+        spec = random_spec(rng, kind_override="dot" if args.dot else "bar" if args.bar_only else None)
+        img = image_variant(render(spec), args.jpeg_quality, args.resize_factor)
+        scan_start = time.perf_counter()
         panels = ex.extract(img, opts)
+        scan_ms.append(1000 * (time.perf_counter() - scan_start))
         reason = None
         if len(panels) != 1:
             reason = f"{len(panels)} panels"
+        elif (args.dot or args.bar_only) and panels[0].kind != ("dot" if args.dot else "bar"):
+            reason = f"detected as {panels[0].kind}, expected {'dot' if args.dot else 'bar'}"
         elif len(panels[0].bars) != len(spec.means):
             reason = f"{len(panels[0].bars)}/{len(spec.means)} bars"
         else:
@@ -319,7 +400,10 @@ def main() -> int:
                 os.makedirs(args.show_failures, exist_ok=True)
                 cv2.imwrite(os.path.join(args.show_failures, f"fail_{i:03d}.png"), img)
     dt = time.time() - t0
-    print(f"charts: {args.n}  fully correct: {ok} ({100 * ok / args.n:.1f}%)  time {dt:.1f}s ({1000 * dt / args.n:.0f} ms/chart)")
+    label = "dot plots" if args.dot else "bar charts" if args.bar_only else "bar/dot charts"
+    print(f"{label}: {args.n}  mean-correct charts: {ok} ({100 * ok / args.n:.1f}%)  "
+          f"time {dt:.1f}s ({1000 * dt / args.n:.0f} ms/chart, including rendering)")
+    print(f"extraction only: p50 {np.median(scan_ms):.0f} ms  p95 {np.percentile(scan_ms, 95):.0f} ms")
     if mean_errs:
         me, ce = np.array(mean_errs), np.array(cap_errs) if cap_errs else np.zeros(1)
         print(f"mean err: median {np.median(me):.3f}%  p95 {np.percentile(me, 95):.3f}%  max {me.max():.2f}%")

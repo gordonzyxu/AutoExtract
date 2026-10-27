@@ -83,7 +83,11 @@ def find_boxes(image: np.ndarray, gray: np.ndarray, dark: np.ndarray, ink: np.nd
         pieces = _split_touching(labels[y:y + ch, x:x + cw] == i, x, y)
         # Boxes drawn side by side share one width; a curved shape (violin,
         # density) falls apart into slices of very different widths.
-        pw = [p[1] - p[0] + 1 for p in pieces]
+        # Compression can leave one-pixel flanks at an otherwise intact box
+        # outline. They are not separate boxes and should not make the whole
+        # connected component fail the shared-width check.
+        all_pw = [p[1] - p[0] + 1 for p in pieces]
+        pw = [width for width in all_pw if width >= max(6, 0.1 * max(all_pw))]
         if len(pw) > 2 and min(pw) < 0.6 * max(pw):
             continue
         for bx1, bx2, by1, by2 in pieces:
@@ -155,7 +159,8 @@ def find_boxes(image: np.ndarray, gray: np.ndarray, dark: np.ndarray, ink: np.nd
         return False
     shared_base = shared_row()
     # most boxes show a median line (or a mean marker) inside
-    inner_mark = sum((not b.uncertain) or (b.mean_px is not None and not shared_base) for b in boxes)
+    inner_mark = sum(getattr(b, "_median_confirmed", not b.uncertain)
+                     or (b.mean_px is not None and not shared_base) for b in boxes)
     if inner_mark < 0.5 * len(boxes):
         return []
     return boxes
@@ -242,10 +247,31 @@ def _measure_box(image, gray, dark, ink, fg, bx1, bx2, by1, by2, x_lo, y_lo, lin
 
     # ---- Q3 / Q1: box edges (outline centre, or the fill edge) ----
     d_in = dark[:, inner]
+    # Morphological opening can shave the outside pixel of a thin outline.
+    # Look on both sides of the component edge for the actual drawn line.
+    reach = 3 * line_w + 5
+    # Prefer the edge at the component boundary. The wider recovery scan is
+    # useful for thin outlines shaved by opening, but on real paper scans it
+    # can choose a nearby grid or whisker stroke even when the local edge is
+    # already readable.
     top = _edge_row(d_in, range(Y1, Y1 + 2 * line_w + 4), line_w)
     bot = _edge_row(d_in, range(Y2, Y2 - 2 * line_w - 4, -1), line_w)
-    q3_px = top if top is not None else Y1 - 0.5
-    q1_px = bot if bot is not None else Y2 + 0.5
+    if top is None:
+        top = _edge_row(d_in, range(max(0, Y1 - reach), Y1 + reach + 1), line_w)
+    if bot is None:
+        bot = _edge_row(d_in, range(min(d_in.shape[0] - 1, Y2 + reach), Y2 - reach - 1, -1), line_w)
+    # A dark fill has no isolated horizontal outline in the binary mask: all
+    # rows of the box score as a "line". Use its component boundary instead.
+    margin = min(reach + 1, max(1, (Y2 - Y1) // 4))
+    # A white median stripe can occupy several rows of a short, dark box.
+    # Its body remains predominantly dark even though the mean falls below
+    # 0.8; an outlined light box has little interior dark coverage.
+    dark_fill = Y2 - Y1 > 2 * margin and d_in[Y1 + margin:Y2 - margin].mean() > 0.65
+    if dark_fill:
+        q3_px, q1_px = float(Y1), float(Y2) - 0.5
+    else:
+        q3_px = top if top is not None else Y1 - 0.5
+        q1_px = bot if bot is not None else Y2 + 0.5
 
     # ---- median: full-width contrasting line inside the box ----
     body = image[Y1:Y2 + 1, inner].astype(float)
@@ -274,6 +300,7 @@ def _measure_box(image, gray, dark, ink, fg, bx1, bx2, by1, by2, x_lo, y_lo, lin
         bot_band = d_in[max(0, Y2 - 3 * line_w - 5):Y2 + 1].mean(axis=1) >= 0.8
         median_px = q3_px if top_band.sum() > bot_band.sum() else q1_px
 
+    median_confirmed = not uncertain
     # ---- whiskers ----
     hi_px, hi_ok = _whisker(dark, ink, cx, int(round(q3_px)) - line_w - 1, -1, bw, line_w, y_lo)
     lo_px, lo_ok = _whisker(dark, ink, cx, int(round(q1_px)) + line_w + 1, +1, bw, line_w,
@@ -290,9 +317,12 @@ def _measure_box(image, gray, dark, ink, fg, bx1, bx2, by1, by2, x_lo, y_lo, lin
     # ---- mean marker: a small blob inside the box that isn't the median ----
     mean_px = _mean_marker(image, X1, X2, q3_px, q1_px, median_px, line_w)
 
-    return Box(x1=X1, x2=X2, q1_px=float(q1_px), median_px=float(median_px), q3_px=float(q3_px),
-               lo_px=float(lo_px), hi_px=float(hi_px), outliers_px=outliers, mean_px=mean_px,
-               uncertain=uncertain)
+    box = Box(x1=X1, x2=X2, q1_px=float(q1_px), median_px=float(median_px), q3_px=float(q3_px),
+              lo_px=float(lo_px), hi_px=float(hi_px), outliers_px=outliers, mean_px=mean_px,
+              uncertain=uncertain,
+              note="capless dashed whisker endpoint needs review" if not (hi_ok and lo_ok) else "")
+    box._median_confirmed = median_confirmed
+    return box
 
 
 def _whisker(dark, ink, cx, start, step, box_w, line_w, limit) -> Tuple[Optional[float], bool]:
@@ -326,10 +356,13 @@ def _whisker(dark, ink, cx, start, step, box_w, line_w, limit) -> Tuple[Optional
             continue
         col = best_col
         y, end, gap = start_m, None, 0
+        dashed = False
         wt = None                         # the whisker's own thickness
         narrow_end = start_m              # last row only as wide as the whisker
         while (y >= limit if step < 0 else y <= limit) and 0 <= y < H:
             if mask[y, col] or mask[y, max(0, col - 1)] or mask[y, min(W - 1, col + 1)]:
+                if end is not None and gap >= 2:
+                    dashed = True
                 # an outlier just past a cap-less whisker (after a gap), or
                 # touching it (the ink widens into a round blob)
                 if end is not None and gap >= 2 and _round_blob(mask, y, col, step, wt or line_w, box_w, after_gap=True):
@@ -368,7 +401,9 @@ def _whisker(dark, ink, cx, start, step, box_w, line_w, limit) -> Tuple[Optional
                     break
             y += step
         if end is not None and abs(end - start_m) > line_w:
-            return float(end), True       # no cap (ggplot style): the whisker's end
+            # With dashes but no cap, the visible last dash can stop several
+            # pixels before the actual data endpoint.
+            return float(end), not dashed
     return None, True                       # no whisker: the box edge is the extreme
 
 

@@ -17,6 +17,8 @@ sys.path.insert(0, os.path.join(HERE, "..", "backend"))
 sys.path.insert(0, HERE)
 
 from figure_extractor import ExtractOptions, FigureExtractor  # noqa: E402
+from line_plots import _error_bar  # noqa: E402
+from fuzz import random_line_spec  # noqa: E402
 from synth import BoxSpec, ChartSpec, LineSpec, render, render_box, render_line  # noqa: E402
 
 LINE = ExtractOptions(bar_names=False, titles=False, chart_type="line")
@@ -89,3 +91,138 @@ def test_line_page_ignores_bars_and_boxes(extractor):
     for img in (render(ChartSpec([12.0, 31.5, 22.0], [1.5, 3.0, 2.2])),
                 render_box(BoxSpec([(2, 5, 7, 9, 13), (4, 8, 11, 15, 19)], ylim=(0, 20)))):
         assert extractor.extract(img, LINE) == []
+
+
+def test_short_capped_whisker_is_not_lost_at_marker_edge():
+    mask = np.zeros((40, 40), np.uint8)
+    import cv2
+    cv2.circle(mask, (20, 20), 5, 1, -1)
+    mask[12:17, 20] = 1
+    mask[12, 17:24] = 1
+    assert _error_bar(mask.astype(bool), 20, 20, 6, -1, 1) == pytest.approx(12)
+    mask[12:17, :] = 0
+    assert _error_bar(mask.astype(bool), 20, 20, 6, -1, 1) is None
+
+
+def test_dark_series_does_not_borrow_neighbour_cap(extractor):
+    rng = np.random.default_rng(7)
+    for _ in range(14):
+        spec = random_line_spec(rng)
+    assert spec.colors[0] == "black" and spec.colors[2] == "#555555"
+    p = extractor.extract(render_line(spec), LINE)[0]
+    black = _match(p.series, spec.ys[0])
+    assert black is not None
+    assert black.points[1].mean_plus_err is None or black.points[1].uncertain
+
+
+def test_aligned_markers_use_numeric_tick_grid(extractor):
+    rng = np.random.default_rng(7)
+    spec = random_line_spec(rng)
+    p = extractor.extract(render_line(spec), LINE)[0]
+    purple = _match(p.series, spec.ys[1])
+    assert purple is not None and p.x_slope is not None
+    assert abs(purple.points[0].x - spec.x[0]) < 0.01 * (spec.x[-1] - spec.x[0])
+
+
+def test_shared_tick_grid_does_not_copy_cap_fragments_across_series(extractor):
+    rng = np.random.default_rng(7)
+    for _ in range(27):
+        spec = random_line_spec(rng)
+    assert len(spec.x) == 6 and len(spec.ys) == 4 and spec.hollow
+    p = extractor.extract(render_line(spec), LINE)[0]
+    assert len(p.series) == 4
+    assert p.x_ticks[0][1:] == (0.0, "0")
+    for colour in ((0, 0, 0), (180, 119, 31), (14, 127, 255)):
+        series = next(s for s in p.series if s.color == colour)
+        assert len(series.points) == len(spec.x)
+        assert max(abs(point.x - x) for point, x in zip(series.points, spec.x)) < 0.01 * spec.x[-1]
+
+
+def test_shared_tick_grid_preserves_a_regularly_staggered_series(extractor):
+    import cv2
+    import matplotlib.pyplot as plt
+
+    ticks = np.array([0, 2, 4, 6, 8, 10], float)
+    fig, ax = plt.subplots(figsize=(5, 3), dpi=150)
+    ax.plot(ticks, [20, 23, 26, 25, 29, 31], "-o", color="tab:red")
+    ax.plot(ticks, [45, 48, 51, 50, 53, 55], "-s", color="tab:blue")
+    ax.plot(ticks + 0.8, [67, 65, 69, 66, 71, 68], "-D", color="tab:green")
+    ax.set_xticks(ticks)
+    ax.set_ylim(0, 100)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    fig.canvas.draw()
+    image = cv2.cvtColor(np.asarray(fig.canvas.buffer_rgba()), cv2.COLOR_RGBA2BGR)
+    plt.close(fig)
+
+    p = extractor.extract(image, LINE)[0]
+    staggered = _match(p.series, [67, 65, 69, 66, 71, 68])
+    assert staggered is not None and len(staggered.points) == len(ticks)
+    assert max(abs(pt.x - expected) for pt, expected in zip(staggered.points, ticks + 0.8)) < 0.03
+
+
+@pytest.mark.parametrize("case,colour", [(17, "tab:purple"), (25, "tab:orange")])
+def test_crossing_series_cap_is_flagged_for_review(extractor, case, colour):
+    rng = np.random.default_rng(7)
+    for _ in range(case + 1):
+        spec = random_line_spec(rng)
+    p = extractor.extract(render_line(spec), LINE)[0]
+    index = spec.colors.index(colour)
+    series = _match(p.series, spec.ys[index])
+    assert series is not None
+    assert series.points[0].uncertain
+
+
+def test_unmeasured_error_bars_are_flagged_when_panel_has_capped_points(extractor):
+    rng = np.random.default_rng(7)
+    for _ in range(14):
+        spec = random_line_spec(rng)
+    panel = extractor.extract(render_line(spec), LINE)[0]
+    points = [pt for series in panel.series for pt in series.points]
+    assert any(pt.cap_hi_px is not None for pt in points)
+    missing = [pt for pt in points if pt.cap_hi_px is None and pt.cap_lo_px is None]
+    assert missing and all(pt.uncertain for pt in missing)
+    assert any("error bars need review" in warning for warning in panel.warnings)
+
+
+def _seeded_line(seed, index):
+    rng = np.random.default_rng(seed)
+    for _ in range(index + 1):
+        spec = random_line_spec(rng)
+    return spec
+
+
+def test_series_crossing_a_flat_segment_is_not_a_dashed_reference(extractor):
+    # The red series' last segment is flat; the black series crosses its row.
+    # That row once read as a dashed reference line and was erased, and the
+    # red line's pale anti-aliased fringe was traced in place of its core.
+    spec = _seeded_line(2026, 28)
+    p = extractor.extract(render_line(spec), LINE)[0]
+    red = _match(p.series, spec.ys[1])
+    assert red is not None and len(red.points) == len(spec.x)
+    span = spec.ylim[1] - spec.ylim[0]
+    assert max(abs(pt.mean - y) for pt, y in zip(red.points, spec.ys[1])) < 0.01 * span
+
+
+def test_one_stray_cap_does_not_flag_a_chart_without_error_bars(extractor):
+    spec = _seeded_line(2026, 26)
+    assert spec.errs is None
+    p = extractor.extract(render_line(spec), LINE)[0]
+    points = [pt for s in p.series for pt in s.points]
+    assert sum(pt.uncertain for pt in points) <= 2
+    assert not any("error bars need review" in w for w in p.warnings)
+
+
+def test_numeric_x_labels_are_read_without_text_detection(extractor, monkeypatch):
+    # Compressed small chart whose tick strokes are too faint: the labels are
+    # split by their ink and recognised directly (detection takes seconds).
+    from fuzz import image_variant
+    spec = _seeded_line(2026, 35)
+    img = image_variant(render_line(spec), 65, 0.75)
+    calls = []
+    original = type(extractor.ocr).boxes
+    monkeypatch.setattr(type(extractor.ocr), "boxes",
+                        lambda self, image: calls.append(image.shape) or original(self, image))
+    p = extractor.extract(img, LINE)[0]
+    assert p.x_slope is not None and not calls

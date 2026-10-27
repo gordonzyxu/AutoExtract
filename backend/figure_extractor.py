@@ -20,7 +20,9 @@ Pipeline per figure:
 from __future__ import annotations
 
 import re
+import hashlib
 import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Tuple
 
@@ -104,7 +106,7 @@ class Panel:
     scale: str = "linear"     # y-axis scale: "linear" or "log" (log10)
     error_type: str = "sem"   # what the error bars show: "sem" or "sd" (from the caption, editable)
     # box plots: what the whiskers show and how mean/SD are estimated
-    whisker_type: str = "minmax"      # "minmax" | "tukey" | "percentile" | "unknown"
+    whisker_type: str = "unknown"     # "minmax" | "tukey" | "percentile" | "unknown"
     mean_method: str = "luo"          # "luo" | "wan" | "hozo"
     sd_method: str = "shi"            # "shi" | "wan" | "hozo"
     warnings: List[str] = field(default_factory=list)
@@ -163,6 +165,8 @@ class OCR:
     def __init__(self) -> None:
         from rapidocr_onnxruntime import RapidOCR
         self.engine = RapidOCR()
+        self._line_cache = OrderedDict()
+        self.line_cache_hits = 0
 
     def boxes(self, image: np.ndarray) -> List[Tuple[Tuple[int, int, int, int], str, float]]:
         """Detect + recognise all text. Returns [((x1, y1, x2, y2), text, score)]."""
@@ -176,6 +180,13 @@ class OCR:
 
     def line(self, image: np.ndarray) -> Tuple[str, float]:
         """Recognise a single pre-cropped line of text (no detection step)."""
+        key = (image.shape, image.dtype.str,
+               hashlib.blake2b(image.tobytes(), digest_size=16).digest())
+        cached = self._line_cache.get(key)
+        if cached is not None:
+            self._line_cache.move_to_end(key)
+            self.line_cache_hits += 1
+            return cached
         h = image.shape[0]
         if h < 32:
             f = 40 / max(h, 1)
@@ -183,9 +194,14 @@ class OCR:
         image = cv2.copyMakeBorder(image, 8, 8, 12, 12, cv2.BORDER_CONSTANT, value=(255, 255, 255))
         result, _ = self.engine(image, use_det=False, use_cls=False, use_rec=True)
         if not result:
-            return "", 0.0
-        text, score = result[0]
-        return text, float(score)
+            answer = ("", 0.0)
+        else:
+            text, score = result[0]
+            answer = (text, float(score))
+        self._line_cache[key] = answer
+        if len(self._line_cache) > 512:
+            self._line_cache.popitem(last=False)
+        return answer
 
 
 _NUM_FIX = str.maketrans({"O": "0", "o": "0", "D": "0", "l": "1", "I": "1", "|": "1",
@@ -206,7 +222,11 @@ def parse_number(text: str) -> Optional[float]:
         return None
     t = t.translate(_NUM_FIX).replace(" ", "")
     # tolerate stray punctuation the recogniser glues on ("60.", "20÷", "50°")
-    t = re.sub(r"^[^\d\-]+|[^\d]+$", "", t)
+    # OCR often drops the leading zero but keeps the decimal point: ".08"
+    # must remain 0.08, not become "08" and then the 0.8 heuristic below.
+    t = re.sub(r"^[^\d.\-]+|[^\d]+$", "", t)
+    if re.fullmatch(r"-?\.\d+", t):
+        t = t.replace(".", "0.", 1)
     # Small labels lose their decimal point ("0.8" -> "08"); a tick label is
     # never written with a leading zero, so restore it ("08" -> 0.8, "005" -> 0.05).
     if re.fullmatch(r"-?0\d+", t):
@@ -324,6 +344,25 @@ def _plausible_axis(slope: float, tick_ys: List[float], inliers: int) -> bool:
     return _is_nice_step(step) or (inliers >= 4 and _is_nice_step(step / 2))
 
 
+def _repair_lost_leading_decimals(readings):
+    """Use other decimal ticks to repair OCR's `.8` -> `8` or `.12` -> `12`."""
+    known = [r for r in readings if r[2] is not None]
+    if not any(0 < abs(r[2]) < 1 and "." in r[1] for r in known):
+        return readings
+    ambiguous = [r for r in known if re.fullmatch(r"[+-]?(?:[2-9]|[1-9]\d)", r[1].strip())]
+    if len(ambiguous) < 2:
+        return readings
+    proposed = [(r[0], r[1], r[2] / (10 ** len(r[1].strip().lstrip("+-")))
+                 if r in ambiguous else r[2], r[3], r[4])
+                for r in readings]
+    raw_fit = robust_linear_fit([(r[0], r[2]) for r in known])
+    fixed_fit = robust_linear_fit([(r[0], r[2]) for r in proposed if r[2] is not None])
+    if (fixed_fit[0] is not None and fixed_fit[2] > raw_fit[2]
+            and _plausible_axis(fixed_fit[0], [r[0] for r in proposed], fixed_fit[2])):
+        return proposed
+    return readings
+
+
 def plot_foreground(gray, region_ink, y_lo, y_hi, x_lo, x_hi, line_w, grid_rows=None) -> np.ndarray:
     """
     Foreground of a plot region: everything except the open background.
@@ -384,7 +423,7 @@ def plot_foreground(gray, region_ink, y_lo, y_hi, x_lo, x_hi, line_w, grid_rows=
 # Extractor
 # --------------------------------------------------------------------------- #
 
-CHART_TYPES = ("bar", "box", "violin", "line")
+CHART_TYPES = ("bar", "dot", "box", "violin", "line")
 
 
 @dataclass
@@ -428,6 +467,7 @@ class FigureExtractor:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         # each panel's foreground is needed by several detectors: keep it
         self._fg_gray, self._fg_cache = gray, {}
+        self._allow_y_ocr_boxes = opts.chart_type in ("box", "violin")
         dark = (gray < DARK_THRESHOLD).astype(np.uint8)
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         ink = ((gray < WHITE_THRESHOLD) | (hsv[:, :, 1] > 40)).astype(np.uint8)
@@ -442,6 +482,20 @@ class FigureExtractor:
             light_dark = (gray < 200).astype(np.uint8)
             if light_dark.mean() < 0.35:
                 panels = self._panels_from(image, gray, light_dark, ink, opts)
+        if not panels and opts.chart_type == "line":
+            # Large journal figures may draw long inward ticks. Their y-axis
+            # morphology is wider than the ordinary limit; retry only when
+            # the inexpensive ordinary passes found no line panels.
+            relaxed_axes = [a for a in self._find_axes(dark, ink, max_thickness=25)
+                            if a["axis_w"] > 15 and a["axis_y"] - a["top"] > 0.25 * gray.shape[0]
+                            and a["right"] - a["axis_left"] > 0.2 * gray.shape[1]]
+            panels = self._panels_from(image, gray, dark, ink, opts,
+                                       relaxed_axes)
+        if not panels and opts.chart_type in ("box", "violin"):
+            # Floating distributions are often drawn against a lone y-axis,
+            # with category labels but no horizontal x-axis stroke.
+            panels = self._panels_from(image, gray, dark, ink, opts,
+                                       self._find_unframed_axes(dark))
 
         if opts.legend_colors and any(not any(b.label for b in p.bars) for p in panels):
             text_boxes = self.ocr.boxes(image)       # slow: only when asked for
@@ -452,9 +506,9 @@ class FigureExtractor:
         panels.sort(key=lambda p: (round(p.plot_top / max(image.shape[0] * 0.1, 1)), p.axis_x))
         return panels
 
-    def _panels_from(self, image, gray, dark, ink, opts) -> List[Panel]:
+    def _panels_from(self, image, gray, dark, ink, opts, axes=None) -> List[Panel]:
         panels = []
-        for axes in self._find_axes(dark, ink):
+        for axes in self._find_axes(dark, ink) if axes is None else axes:
             try:
                 panel = self._build_panel(image, gray, dark, ink, axes, opts)
             except Exception as e:  # one bad panel must not sink the figure
@@ -509,11 +563,11 @@ class FigureExtractor:
 
     # ---- step 1: axes ---------------------------------------------------- #
 
-    def _find_axes(self, dark: np.ndarray, ink: np.ndarray) -> List[dict]:
+    def _find_axes(self, dark: np.ndarray, ink: np.ndarray, max_thickness: int = 15) -> List[dict]:
         H, W = dark.shape
         kv = max(40, int(0.06 * H))
         kh = max(40, int(0.04 * W))
-        verts = _merge_collinear(_line_components(dark, (1, max(20, kv // 3)), max_thickness=15), kv)
+        verts = _merge_collinear(_line_components(dark, (1, max(20, kv // 3)), max_thickness=max_thickness), kv)
 
         # The x-axis is found by scanning rows at the bottom of each vertical
         # line, not by morphology: dark filled bars standing on the axis would
@@ -579,6 +633,22 @@ class FigureExtractor:
         return uniq
 
     @staticmethod
+    def _find_unframed_axes(dark: np.ndarray) -> List[dict]:
+        """Strong left-side y-axes whose bottoms have no horizontal stroke."""
+        H, W = dark.shape
+        verts = _merge_collinear(_line_components(dark, (1, max(20, H // 50)), 15),
+                                 max(40, int(0.4 * H)))
+        candidates = []
+        for x, y, width, height in verts:
+            if (x > 0.28 * W or y > 0.25 * H or y + height < 0.65 * H
+                    or height < 0.5 * H or width > 5):
+                continue
+            candidates.append(dict(axis_left=x, axis_w=width, top=y,
+                                   axis_y=float(y + height - 1), axis_h=width,
+                                   right=W - 3))
+        return sorted(candidates, key=lambda a: (-a["axis_y"] + a["top"], a["axis_left"]))[:2]
+
+    @staticmethod
     def _detached_x_axis(dark, ink, vx, vw, v_bottom, kh) -> Optional[dict]:
         """
         R / Stata style axes don't meet: the y-axis stops at its last tick and
@@ -616,6 +686,15 @@ class FigureExtractor:
         panel = Panel(x1=axis_left, y1=top, x2=right, y2=int(axis_y),
                       axis_x=axis_x, axis_y=axis_y, plot_top=top, plot_right=right)
 
+        self._axis_ocr_candidate = None
+        if opts.chart_type == "box":
+            self._axis_ocr_candidate = lambda: bool(self._find_box_plot(
+                image, gray, dark, ink, axis_left + axis_w, right, top, axis_y,
+                max(1, axis_h), []))
+        elif opts.chart_type == "violin":
+            self._axis_ocr_candidate = lambda: bool(self._find_violin_plot(
+                image, gray, dark, ink, axis_left + axis_w, right, top, axis_y,
+                max(1, axis_h), []))
         self._calibrate(panel, image, dark, axis_left, top, int(round(axis_y)), axis_h)
         if panel.slope is None:
             return None                 # no readable axis: not a chart we can measure
@@ -641,6 +720,10 @@ class FigureExtractor:
             if not violins:
                 return None
             panel.kind, panel.boxes = "violin", violins
+            # The rendered density may extend beyond the sample extremes.
+            # Its end semantics require confirmation from the figure/caption.
+            panel.whisker_type = "unknown"
+            panel.warnings.append("Confirm whether violin ends show the data range before using them as min/max")
             return self._finish_box_panel(image, gray, panel, opts, line_w, axis_left, axis_y, H, W)
         if violins:
             return None                  # a violin plot: the Violin Analyzer's job
@@ -662,8 +745,22 @@ class FigureExtractor:
             on_bars = bars and all(any(b.x1 - 3 <= (bx.x1 + bx.x2) / 2 <= b.x2 + 3
                                        and bx.x2 - bx.x1 < 0.7 * (b.x2 - b.x1) for b in bars)
                                    for bx in boxes)
-            if on_bars or (len(boxes) <= 2 and len(bars) > len(boxes)):
+            min_box_width = min(bx.x2 - bx.x1 for bx in boxes)
+            wide_bars = sum(b.x2 - b.x1 >= min_box_width for b in bars)
+            if on_bars or (len(boxes) <= 2 and wide_bars > len(boxes)):
                 boxes = []
+            elif (len(bars) >= 3 and sum(
+                    not any(bx.x1 - 3 <= (b.x1 + b.x2) / 2 <= bx.x2 + 3
+                            for bx in boxes) for b in bars) >= 2):
+                # A legend or stray mark high above a short bar can look like
+                # a box.  Require other bars away from every candidate: the
+                # narrow dotted whiskers below a real box can also mimic bars.
+                plot_height = axis_y - top
+                boxes = [bx for bx in boxes if not any(
+                    bx.x1 <= (b.x1 + b.x2) / 2 <= bx.x2
+                    and b.x2 - b.x1 <= bx.x2 - bx.x1
+                    and b.top_px > bx.q1_px + 0.12 * plot_height
+                    for b in bars)]
         if boxes and opts.chart_type != "box":
             return None                  # a box plot: the Box Analyzer's job
         if boxes:
@@ -702,12 +799,19 @@ class FigureExtractor:
             panel.bars = sorted(both, key=lambda b: b.x1)
         if len(panel.bars) < 2:
             # scatter/dot plot: mean line with error whiskers, no bars
-            dots = self._find_dot_groups(ink, axis_left + axis_w, right, top, axis_y, line_w)
+            dots = self._find_dot_groups(ink, axis_left + axis_w, right, top, axis_y, line_w, dark)
             if dots:
                 panel.bars, panel.kind = dots, "dot"
         if len(panel.bars) < 2:
             # Real one-bar charts are vanishingly rare; a lone "bar" is far more
             # often a box plot's box or a filled shape, so don't report it.
+            return None
+        if opts.chart_type == "dot" and panel.kind != "dot":
+            return None
+        if panel.kind == "bar" and sum(b.x2 - b.x1 + 1 for b in panel.bars) > 2.0 * (right - x_lo):
+            # Bar footprints cannot occupy more horizontal space than the
+            # plot. Dense movement traces and photos can yield overlapping
+            # pseudo-bars when their internal grid is mistaken for axes.
             return None
         # The markers of a line plot look like dot-plot groups; in a dot plot
         # no line joins the groups. (Only checked for dot panels: tracing
@@ -722,6 +826,12 @@ class FigureExtractor:
         # A rug of data ticks along the x axis (under a line or density plot)
         # reads as many slivers; real bar charts are not all slivers.
         if panel.kind == "bar" and all(abs(b.top_px - base_y) < 0.04 * (axis_y - top) for b in panel.bars):
+            return None
+        if (panel.kind == "bar" and len(panel.bars) == 2
+                and all(b.x2 - b.x1 < 0.07 * (right - x_lo) for b in panel.bars)
+                and all(abs(b.top_px - base_y) < 0.06 * (axis_y - top) for b in panel.bars)):
+            # Adjacent square scatter markers resting on the x-axis can look
+            # like two tiny bars, especially in a mixed dot/column figure.
             return None
         if panel.kind == "bar" and self._stacked(image, panel.bars, base_y, line_w):
             return None                 # stacked bars: the top is a sum, not a group mean
@@ -763,24 +873,47 @@ class FigureExtractor:
         if ticks:
             tick_len = int(np.median([t[1] for t in ticks]))
             ticks = [t for t in ticks if abs(t[1] - tick_len) <= max(3, 0.4 * tick_len)]
+            if (len(ticks) >= 2 and ticks[-1][0] - ticks[0][0] < 0.65 * (axis_row - top)):
+                # Compression may erase the upper tick strokes while their
+                # numeric label rows remain legible. Add those rows only when
+                # they form a regular sequence containing every found tick.
+                label_rows = self._label_rows_as_ticks(image, axis_left, top, axis_row, line_w)
+                if len(label_rows) >= len(ticks) + 2:
+                    spacing = float(np.median(np.diff([r[0] for r in label_rows])))
+                    if all(any(abs(y - ty) <= max(3, 0.2 * spacing) for y, _ in label_rows)
+                           for ty, _ in ticks):
+                        ticks = [(y, tick_len) for y, _ in label_rows]
+        ocr_readings = None
         if len(ticks) < 2:
             # Some styles draw no tick marks: labels are centred on their value,
             # so the label rows beside the axis stand in for ticks.
             ticks = self._label_rows_as_ticks(image, axis_left, top, axis_row, line_w)
             tick_len = 0
+            if len(ticks) < 2 and getattr(self, "_allow_y_ocr_boxes", True):
+                # A rotated axis title can contaminate the row projection;
+                # look for individual numeric label boxes near the axis.
+                ocr_readings = self._ocr_y_labels(image, axis_left, top, axis_row)
+                ticks = [(r[0], 0) for r in ocr_readings]
         if not ticks:
             return
 
         spacing = np.median(np.diff([t[0] for t in ticks])) if len(ticks) > 1 else 40
         half = int(max(8, min(0.45 * spacing, 30)))
-        label_right = axis_left - tick_len - (2 if tick_len else 4)   # keep the axis line out
+        label_right = axis_left - tick_len - (2 if tick_len else 1)   # keep the axis line out
         upright = []
-        for ty, _ in ticks:
-            crop, box = self._crop_label(image, dark, int(ty), half, label_right)
-            text, val, score = ("", None, 0.0)
-            if crop is not None:
-                text, val, score = self._read_tick_label(crop)
-            upright.append((ty, text, val, score, box))
+        if ocr_readings is not None:
+            upright = ocr_readings
+        else:
+            for ty, _ in ticks:
+                crop, box = self._crop_label(image, dark, int(ty), half, label_right)
+                text, val, score = ("", None, 0.0)
+                if crop is not None:
+                    text, val, score = self._read_tick_label(crop)
+                upright.append((ty, text, val, score, box))
+        # Repair the upright candidate before comparing it with rotated OCR;
+        # otherwise a coherent decimal axis can lose to high-confidence
+        # sideways reads that dropped every decimal point.
+        upright = _repair_lost_leading_decimals(upright)
         readings = upright
         # Some styles (R base graphics) write y labels parallel to the axis:
         # the characters stack vertically. Read those columns rotated and keep
@@ -814,6 +947,7 @@ class FigureExtractor:
                     digits(rotated) > digits(upright) + 0.3 or
                     np.mean([r[3] for r in rotated]) > np.mean([r[3] for r in upright]) + 0.05)):
                 readings = rotated
+        readings = _repair_lost_leading_decimals(readings)
         pts = []
         for ty, text, val, _, box in readings:
             if box:
@@ -837,6 +971,18 @@ class FigureExtractor:
             if la is not None and la < 0 and ln >= max(3, len(pos) - 1):
                 a, b, n = la, lb, ln
                 panel.scale = "log"
+        if (a is None and tick_len == 0 and ocr_readings is None
+                and getattr(self, "_allow_y_ocr_boxes", True)):
+            # The narrow row projection can still lock onto regular-looking
+            # fragments of a vertical title. Pay for detector OCR only when
+            # those rows failed to produce a usable calibration.
+            fallback = self._ocr_y_labels(image, axis_left, top, axis_row)
+            if fallback:
+                fa, fb, fn = robust_linear_fit([(r[0], r[2]) for r in fallback])
+                if fa is not None and _plausible_axis(fa, [r[0] for r in fallback], fn):
+                    a, b, n = fa, fb, fn
+                    panel.ticks = [(r[0], r[2], r[1]) for r in fallback]
+                    panel.label_left = min(r[4][0] for r in fallback)
         panel.slope, panel.intercept, panel.calibration_inliers = a, b, n
         if n and n < len(ticks):
             panel.warnings.append(f"{len(ticks) - n} of {len(ticks)} tick labels ignored as misreads")
@@ -846,6 +992,30 @@ class FigureExtractor:
         text, score = self.ocr.line(crop)
         val = parse_number(text)
         return text, val, (score if val is not None else 0.0)
+
+    def _ocr_y_labels(self, image, axis_left, top, axis_row):
+        """Numeric labels aligned to an axis with inward or absent tick marks."""
+        H, W = image.shape[:2]
+        if axis_left > 0.3 * W or axis_row - top < 0.35 * H or top > 0.35 * H:
+            return []  # short box edges and interior strokes are not y-axes
+        candidate = getattr(self, "_axis_ocr_candidate", None)
+        if candidate is not None and not candidate():
+            return []  # no distribution geometry worth an expensive OCR pass
+        x0, x1 = max(0, axis_left - 85), max(0, axis_left - 1)
+        y0, y1 = max(0, top - 12), min(image.shape[0], axis_row + 12)
+        if x1 - x0 < 8 or y1 - y0 < 20:
+            return []
+        found = []
+        for (bx1, by1, bx2, by2), label, score in self.ocr.boxes(image[y0:y1, x0:x1]):
+            val = parse_number(label)
+            if (val is None or score < 0.65 or bx2 - bx1 > 30 or by2 - by1 > 24
+                    or axis_left - (x0 + bx2) > 35):
+                continue
+            ty = y0 + (by1 + by2) / 2.0
+            found.append((ty, label, val, score,
+                          (x0 + bx1, y0 + by1, x0 + bx2, y0 + by2)))
+        found.sort(key=lambda r: r[0])
+        return found if len(found) >= 2 else []
 
     def _read_rotated_labels(self, image, ticks, label_right, spacing) -> list:
         """
@@ -911,19 +1081,22 @@ class FigureExtractor:
         if x1 - x0 < 8 or y1 - y0 < 8:
             return []
         text = cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY) < TEXT_THRESHOLD
-        # only text ending close to the axis (tick labels, not the axis title)
-        near = text[:, max(0, text.shape[1] - 30):]
-        rows = []
-        for s, e in _runs(near.any(axis=1)):
-            h = e - s + 1
-            if 5 <= h <= 60:
-                rows.append((y0 + (s + e) / 2.0, 0))
-        if len(rows) < 2:
-            return []
-        gaps = np.diff([r[0] for r in rows])
-        if gaps.min() < 0.5 * np.median(gaps):      # stray marks, not a label column
-            return []
-        return rows
+        # The last few columns catch right-aligned numbers while avoiding a
+        # vertical title further left. Widen only if that narrow band has no
+        # regular label rows.
+        for width in (12, 30):
+            near = text[:, max(0, text.shape[1] - width):]
+            rows = []
+            for s, e in _runs(near.any(axis=1)):
+                h = e - s + 1
+                if 5 <= h <= 60:
+                    rows.append((y0 + (s + e) / 2.0, 0))
+            if len(rows) < 2:
+                continue
+            gaps = np.diff([r[0] for r in rows])
+            if gaps.min() >= 0.5 * np.median(gaps):
+                return rows
+        return []
 
     def _crop_label(self, image, dark, ty, half, label_right):
         """
@@ -965,7 +1138,20 @@ class FigureExtractor:
         gy2 = max(g[3] for g in group) + y1
         pad = max(3, int(0.35 * (gy2 - gy1 + 1)))
         # never pad rightwards into the tick or axis line (it reads as "l" or "1")
-        crop = image[max(0, gy1 - pad): gy2 + pad + 1, max(0, gx1 - pad): min(gx2 + pad, label_right - 1) + 1]
+        y_start, y_stop = max(0, gy1 - pad), gy2 + pad + 1
+        x_start, x_stop = max(0, gx1 - pad), min(gx2 + pad, label_right - 1) + 1
+        crop = image[y_start:y_stop, x_start:x_stop]
+        # At screenshot resolution a decimal point may be only 2 x 2 pixels.
+        # It is too small for the component grouping above, leaving the OCR
+        # crop as ".4" instead of "0.4" (or "4" if OCR drops the dot too).
+        # A tiny baseline blob just left of the digit is evidence to include
+        # the preceding glyph, without widening every integer-axis crop.
+        glyph = (cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) < TEXT_THRESHOLD).astype(np.uint8)
+        n_small, _, small_stats, _ = cv2.connectedComponentsWithStats(glyph, connectivity=8)
+        if any(x <= 2 and w <= 3 and h <= 3 and area <= 6 and y >= 0.55 * crop.shape[0]
+               for x, y, w, h, area in small_stats[1:]):
+            x_start = max(0, gx1 - max(pad, 2 * text_h))
+            crop = image[y_start:y_stop, x_start:x_stop]
         return crop, (gx1, gy1, gx2, gy2)
 
     @staticmethod
@@ -1098,6 +1284,7 @@ class FigureExtractor:
         if not series:
             return None
         panel.kind, panel.series = "line", series
+        raw_points = {id(s): list(s.points) for s in series}
         # A marker hidden under another series' marker leaves a gap at an x
         # where the other series have points: read it from the trace there.
         xs = sorted(pt.x_px for s in series if s.markers for pt in s.points)
@@ -1127,10 +1314,80 @@ class FigureExtractor:
         self._calibrate_x(panel, image, dark, x_lo, right, int(round(axis_y)), line_w)
         tick_xs = [t[0] for t in panel.x_ticks]
         spacing = float(np.median(np.diff(tick_xs))) if len(tick_xs) > 1 else None
+        # When several independently detected series put a marker on nearly
+        # every labeled tick, those ticks provide stronger x evidence than
+        # extra blobs from hollow-marker edges or nearby error caps.
+        shared_tick_grid = bool(
+            spacing and len(series) >= 3 and len(tick_xs) >= 3 and
+            sum(sum(any(abs(pt.x_px - tx) <= 0.12 * spacing
+                        for pt in raw_points[id(s)]) for s in series) >= 2
+                for tx in tick_xs) >= 0.8 * len(tick_xs))
+        if shared_tick_grid:
+            for s in series:
+                if not s.markers:
+                    continue
+                observed = raw_points[id(s)]
+                if len(observed) >= 3:
+                    offsets = np.array([pt.x_px - min(tick_xs, key=lambda tx: abs(pt.x_px - tx))
+                                        for pt in observed])
+                    gaps = np.diff(sorted(pt.x_px for pt in observed))
+                    shift = float(np.median(offsets))
+                    # A whole series can intentionally use staggered x
+                    # values. A consistent signed offset and regular point
+                    # spacing distinguish it from scattered cap fragments.
+                    staggered = (0.14 * spacing <= abs(shift) <= 0.5 * spacing and
+                                 np.median(np.abs(offsets - shift)) <= 0.04 * spacing and
+                                 abs(float(np.median(gaps)) - spacing) <= 0.15 * spacing)
+                    if staggered:
+                        s.points = observed
+                        continue
+                self._snap_to_ticks(s, observed, tick_xs, 0.12 * spacing, 0.12 * spacing, line_w)
+        # When nearly every labelled x tick hosts a marker, use the tick
+        # positions as the chart's shared point grid. Caps and overlapped
+        # markers can otherwise create extra marker candidates beside a tick.
+        marked = [pt for s in series if s.markers for pt in s.points]
+        if not shared_tick_grid and spacing and len(tick_xs) >= 3 and marked:
+            near_tick = lambda x: min(abs(x - tx) for tx in tick_xs) <= 0.2 * spacing
+            aligned = sum(near_tick(pt.x_px) for pt in marked) >= 0.65 * len(marked)
+            covered_ticks = sum(any(abs(pt.x_px - tx) <= 0.2 * spacing for pt in marked)
+                                for tx in tick_xs)
+            if aligned and covered_ticks >= 0.7 * len(tick_xs):
+                for s in series:
+                    if s.markers:
+                        # a small morphology shift in a partly occluded
+                        # marker should not change x on a confirmed grid
+                        self._snap_to_ticks(s, s.points, tick_xs, 0.2 * spacing, 0.1 * spacing, line_w)
+        # Check dark fallback caps after shared-column recovery. A marker
+        # hidden under another series' marker may only become visible here;
+        # a black cap spanning that marker is ambiguous even if its two ends
+        # appear symmetric.
+        for s in series:
+            for point in s.points:
+                if not getattr(point, "_cap_from_dark", False):
+                    continue
+                if point.cap_hi_px is None or point.cap_lo_px is None:
+                    continue
+                if any(other is not s and
+                       any(abs(mark.x_px - point.x_px) <= 3 * line_w + 4 and
+                           point.cap_hi_px + line_w < mark.y_px < point.cap_lo_px - line_w
+                           for mark in other.points)
+                       for other in series):
+                    point.uncertain = True
         for s in series:
             if not s.markers:
                 # no markers: the data are the trace, read at the x ticks
                 s.points = [LinePoint(x_px=tx, y_px=s.y_at(tx)) for tx in tick_xs if s.y_at(tx) is not None]
+            else:
+                marker_xs = [pt.x_px for pt in s.points]
+                for pt in s.points:
+                    fitted = s.line_y_at(pt.x_px, 3 * line_w + 4, marker_xs)
+                    if fitted is not None and abs(fitted - pt.y_px) > line_w + 2:
+                        # A cap or overlapping marker can be mistaken for a
+                        # marker centre. The entering and leaving line segments
+                        # offer an independent height at that x position.
+                        if abs(fitted - pt.y_px) < 0.08 * (axis_y - top):
+                            pt.y_px = fitted
+                        pt.uncertain = True
             for pt in s.points:
                 pt.mean = panel.value_at(pt.y_px)
                 # error bars may be one-sided; use the side that is drawn
@@ -1146,11 +1403,52 @@ class FigureExtractor:
         series[:] = [s for s in series if s.points]
         if not series:
             return None
+        # Once this panel visibly has error bars, an unmeasured cap is a
+        # missing observation that needs review, not a confirmed zero error.
+        # One stray "cap" (a crossing line, a legend mark) in a chart without
+        # error bars must not send every point to review: require caps on a
+        # real share of the points. Counting only confirmed caps would miss
+        # far more genuinely absent error bars, so any measured cap counts.
+        n_points = sum(len(s.points) for s in series)
+        n_capped = sum(pt.cap_hi_px is not None or pt.cap_lo_px is not None
+                       for s in series for pt in s.points)
+        has_error_bars = n_capped >= max(2, 0.25 * n_points)
+        if has_error_bars:
+            missing_caps = [pt for s in series for pt in s.points
+                            if pt.cap_hi_px is None and pt.cap_lo_px is None]
+            for pt in missing_caps:
+                pt.uncertain = True
+            if missing_caps:
+                panel.warnings.append(f"{len(missing_caps)} line point error bars need review")
         if opts.titles:
             panel.y_title = self._read_y_title(image, panel)
         panel.y2 = int(min(H - 1, axis_y + 0.12 * H))
         panel.x1 = int(max(0, axis_left - 0.12 * W))
         return panel
+
+    @staticmethod
+    def _snap_to_ticks(s, observed, tick_xs, near, snap, line_w) -> None:
+        """
+        Put a marker series on the panel's x tick grid: the nearest marker
+        within `near` of each tick (moved onto it when within `snap`), or the
+        line's height there, flagged, when no marker was found.
+        """
+        snapped = []
+        for tx in tick_xs:
+            close = [pt for pt in observed if abs(pt.x_px - tx) <= near]
+            if close:
+                pt = min(close, key=lambda candidate: abs(candidate.x_px - tx))
+                if abs(pt.x_px - tx) <= snap:
+                    pt.x_px = tx
+                snapped.append(pt)
+                continue
+            y = s.line_y_at(tx, 3 * line_w + 4, [pt.x_px for pt in observed])
+            if y is None:
+                y = s.y_at(tx)
+            if y is not None:
+                snapped.append(LinePoint(x_px=tx, y_px=y, uncertain=True))
+        if len(snapped) >= 0.7 * len(tick_xs):
+            s.points = snapped
 
     def _calibrate_x(self, panel: Panel, image, dark, x_lo, x_hi, axis_row, line_w) -> None:
         """
@@ -1171,6 +1469,10 @@ class FigureExtractor:
                 if e - s + 1 <= 3 * line_w + 3:
                     ticks.append(((s + e) / 2.0, int(np.median(run[s:e + 1]))))
         if len(ticks) < 2:
+            # Many published figures print x labels directly below a framed
+            # axis, without downward tick strokes. Detect the aligned labels
+            # only in that case; the ordinary stroke path stays inexpensive.
+            self._ocr_numeric_x_labels(panel, image, x_lo, x_hi, y0)
             return
         spacing = float(np.median(np.diff([t[0] for t in ticks])))
         half = int(max(8, min(0.48 * spacing, 60)))
@@ -1198,6 +1500,81 @@ class FigureExtractor:
         a, b, n = robust_linear_fit([(-px, v) for px, v in pts])
         if a is not None and n >= max(2, int(np.ceil(0.5 * len(ticks)))):
             panel.x_slope, panel.x_intercept = -a, b
+        if panel.x_slope is None and pts and len(ticks) <= 8:
+            # Tick strokes were found, but their crops can include a marker or
+            # nearby significance glyph. Retry only when at least one tick
+            # already reads as numeric, to avoid detector OCR on categorical
+            # axes and dense minor-tick scales.
+            self._ocr_numeric_x_labels(panel, image, x_lo, x_hi, y0)
+        if panel.x_slope is not None:
+            # OCR can read a numeric zero tick as the letter O. Preserve the
+            # printed format of other labels, but export this unambiguous
+            # numeric tick as "0" once the whole axis is calibrated.
+            panel.x_ticks = [(px, value, "0" if value == 0 and label.strip().lower() == "o"
+                              else label) for px, value, label in panel.x_ticks]
+
+    def _ocr_numeric_x_labels(self, panel, image, x_lo, x_hi, y0):
+        H = image.shape[0]
+        ya, yb = y0 + 1, min(H, y0 + 65)
+        if yb - ya < 8:
+            return
+        # Text detection on a thin strip is slow (the detector upscales its
+        # short side), so first split the label row into words by its ink
+        # and read each with the recogniser alone.
+        if self._fit_x_labels(panel, self._x_label_words(image, max(0, x_lo - 15), x_hi, ya, yb)):
+            return
+        labels = []
+        for (bx1, by1, bx2, by2), label, score in self.ocr.boxes(image[ya:yb, x_lo:x_hi + 1]):
+            val = parse_number(label)
+            if val is None or score < 0.65 or by2 - by1 > 45:
+                continue
+            labels.append((float(x_lo + (bx1 + bx2) / 2), float(ya + (by1 + by2) / 2), val, label))
+        self._fit_x_labels(panel, labels)
+
+    def _x_label_words(self, image, x_lo, x_hi, ya, yb):
+        """[(x, y, value, text)] for numeric words in the first text row below the axis."""
+        text = cv2.cvtColor(image[ya:yb, x_lo:x_hi + 1], cv2.COLOR_BGR2GRAY) < TEXT_THRESHOLD
+        rows = [(s, e) for s, e in _runs(text.any(axis=1)) if 5 <= e - s + 1 <= 45]
+        # Tick strokes blurred past the stroke detector form a row of thin
+        # marks against the axis; the labels are the next row.
+        rows = [(s, e) for s, e in rows
+                if s > 2 or any(b - a + 1 > 4 for a, b in _runs(text[s:e + 1].any(axis=0)))]
+        if not rows:
+            return []
+        s, e = rows[0]
+        band_h = e - s + 1
+        cols = _runs(text[s:e + 1].any(axis=0))
+        # characters of one number sit closer than half a glyph height
+        words = []
+        for a, b in cols:
+            if words and a - words[-1][1] <= max(3, 0.5 * band_h):
+                words[-1][1] = b
+            else:
+                words.append([a, b])
+        out = []
+        for a, b in words:
+            crop = image[max(0, ya + s - 3): ya + e + 4, max(0, x_lo + a - 3): x_lo + b + 4]
+            label, score = self.ocr.line(crop)
+            val = parse_number(label)
+            if val is not None and score >= 0.3:   # single glyphs read with low confidence; the axis fit rejects misreads
+                out.append((float(x_lo + (a + b) / 2), float(ya + (s + e) / 2), val, label))
+        return out
+
+    def _fit_x_labels(self, panel, labels) -> bool:
+        if len(labels) < 2:
+            return False
+        median_y = float(np.median([v[1] for v in labels]))
+        labels = sorted(v for v in labels if abs(v[1] - median_y) <= 10)
+        if len(labels) < 2:
+            return False
+        pts = [(x, val) for x, _, val, _ in labels]
+        a, b, n = robust_linear_fit([(-px, v) for px, v in pts])
+        if a is not None and n >= max(2, int(np.ceil(0.7 * len(labels)))):
+            panel.x_ticks = [(x, val, "0" if val == 0 and label.strip().lower() == "o" else label)
+                             for x, _, val, label in labels]
+            panel.x_slope, panel.x_intercept = -a, b
+            return True
+        return False
 
     def _finish_box_panel(self, image, gray, panel, opts, line_w, axis_left, axis_y, H, W) -> Panel:
         """Values, names and title for a box or violin panel."""
@@ -1399,7 +1776,7 @@ class FigureExtractor:
         self._choose_caps(bars, line_w)
         return bars
 
-    def _find_dot_groups(self, ink, x_lo, x_hi, top, axis_y, line_w) -> List[Bar]:
+    def _find_dot_groups(self, ink, x_lo, x_hi, top, axis_y, line_w, dark=None) -> List[Bar]:
         """
         Dot plots draw each group's mean as a short horizontal line, with a
         narrower cap above it joined by a vertical whisker. Find horizontal
@@ -1408,35 +1785,68 @@ class FigureExtractor:
         y_hi = int(axis_y) - line_w - 1
         if y_hi - top < 20 or x_hi - x_lo < 20:
             return []
-        region = ink[top:y_hi, x_lo:x_hi + 1]
         k = max(15, int(0.06 * (x_hi - x_lo)))
-        opened = cv2.morphologyEx(region, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1)))
-        n, _, stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
         segs = []
-        for i in range(1, n):
-            x, y, w, h, _ = stats[i]
-            # mean lines can be drawn thicker than the axis; require a line shape
-            if h > max(2 * line_w + 6, 16) or w < 3 * h:
-                continue
-            x1, x2, yc = x_lo + x, x_lo + x + w - 1, top + y + (h - 1) / 2.0
-            if yc - top < 2 * line_w + 3:
-                continue          # plot frame / top tick level, not a mean line
-            # significance brackets turn down at both ends
-            below = top + y + h + 1                     # first row under the segment
-            ends_down = all(ink[below + 1: below + 7, ex].mean() > 0.5
-                            for ex in (x1 + 1, x2 - 1)) if below + 7 < ink.shape[0] else False
-            # gridlines and frame lines run across the whole plot
-            if not ends_down and w < 0.6 * (x_hi - x_lo):
-                segs.append(dict(x1=x1, x2=x2, yc=yc, w=w, y0=top + y))
+        sources = [ink]
+        if dark is not None:
+            sources.append(dark)
+            # A coloured whisker or a hollow sample dot can split a black
+            # mean stroke. Bridge only a short horizontal interruption, then
+            # apply the same long-line opening and width checks as above.
+            sources.append(cv2.morphologyEx(
+                dark, cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (max(5, 4 * line_w + 1), 1))))
+        for source in sources:
+            region = source[top:y_hi, x_lo:x_hi + 1]
+            opened = cv2.morphologyEx(region, cv2.MORPH_OPEN,
+                                      cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1)))
+            n, _, stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
+            for i in range(1, n):
+                x, y, w, h, _ = stats[i]
+                # mean lines can be drawn thicker than the axis; require a line shape
+                if h > max(2 * line_w + 6, 16) or w < 3 * h:
+                    continue
+                x1, x2, yc = x_lo + x, x_lo + x + w - 1, top + y + (h - 1) / 2.0
+                if yc - top < 2 * line_w + 3:
+                    continue          # plot frame / top tick level, not a mean line
+                # significance brackets turn down at both ends
+                below = top + y + h + 1                     # first row under the segment
+                ends_down = all(ink[below + 1: below + 7, ex].mean() > 0.5
+                                for ex in (x1 + 1, x2 - 1)) if below + 7 < ink.shape[0] else False
+                # gridlines and frame lines run across the whole plot
+                if not ends_down and w < 0.6 * (x_hi - x_lo):
+                    # A light gridline split by overlaid dots can leave one
+                    # short fragment reaching the frame. That fragment can
+                    # otherwise mask a nearby true mean stroke as a bracket.
+                    if x1 <= x_lo + line_w + 2 or x2 >= x_hi - line_w - 2:
+                        continue
+                    candidate = dict(x1=x1, x2=x2, yc=yc, w=w, y0=top + y)
+                    duplicate = next((i for i, s in enumerate(segs)
+                                      if abs(s["yc"] - yc) <= max(2, line_w + 1)
+                                      and min(s["x2"], x2) - max(s["x1"], x1) >= 0.7 * min(s["w"], w)), None)
+                    if duplicate is None:
+                        segs.append(candidate)
+                    elif w > segs[duplicate]["w"] + 1:
+                        # The broad mask can give only half a mean stroke when
+                        # overlaid dots interrupt it. Keep a fuller stroke
+                        # recovered from the dark mask or horizontal closing.
+                        segs[duplicate] = candidate
         if not segs:
             return []
         # A bracket spans several groups: drop segments whose extent covers
         # the centres of two or more other column positions.
-        centers = sorted((s["x1"] + s["x2"]) / 2 for s in segs)
-        cols: List[float] = []
+        # A short cap or dot chord belongs to its wider mean stroke. Do not
+        # let its shifted centre create an artificial second group column.
+        center_width = max(s["w"] for s in segs)
+        centers = sorted((s["x1"] + s["x2"]) / 2 for s in segs
+                         if s["w"] >= 0.55 * center_width)
+        clusters: List[List[float]] = []
         for c in centers:
-            if not cols or c - cols[-1] > 8:
-                cols.append(c)
+            if clusters and c - clusters[-1][-1] <= max(8, 0.25 * center_width):
+                clusters[-1].append(c)
+            else:
+                clusters.append([c])
+        cols = [float(np.median(cluster)) for cluster in clusters]
         segs = [s for s in segs
                 if sum(s["x1"] - 2 <= c <= s["x2"] + 2 for c in cols) <= 1]
         if not segs:
@@ -1458,13 +1868,28 @@ class FigureExtractor:
             mean_line = max(g, key=lambda s: s["w"])
             if mean_line["w"] < 0.5 * widest:
                 continue
-            # a box plot has box edges and median at the same width: not mean ± error
-            if sum(s["w"] >= 0.8 * mean_line["w"] for s in g) >= 2:
+            # Adjacent strokes can be one thick mean line fragmented by dots.
+            # Box edges are distinct horizontal levels, further apart.
+            wide_levels = [s["yc"] for s in g if s["w"] >= 0.8 * mean_line["w"]]
+            if len(wide_levels) >= 2 and np.ptp(wide_levels) > max(3 * line_w + 3, 0.025 * (axis_y - top)):
                 return []
             cx = int(round((mean_line["x1"] + mean_line["x2"]) / 2))
             infos.append(self._dot_cap(ink, cx, mean_line, line_w, top))
             bars.append(Bar(x1=int(mean_line["x1"]), x2=int(mean_line["x2"]),
-                            top_px=float(mean_line["yc"]), cap_px=None))
+                            top_px=float(np.median(wide_levels)), cap_px=None))
+        # A dark gridline fragment may appear beside the real mean when the
+        # broader foreground mask merges the mean into a light gridline.
+        # Distinct groups cannot have substantially overlapping mean strokes.
+        chosen = []
+        for i in sorted(range(len(bars)), key=lambda j: bars[j].x2 - bars[j].x1, reverse=True):
+            b = bars[i]
+            if any(min(b.x2, bars[j].x2) - max(b.x1, bars[j].x1) + 1
+                   > 0.25 * min(b.x2 - b.x1 + 1, bars[j].x2 - bars[j].x1 + 1)
+                   for j in chosen):
+                continue
+            chosen.append(i)
+        chosen.sort(key=lambda j: bars[j].x1)
+        bars, infos = [bars[j] for j in chosen], [infos[j] for j in chosen]
         # a lone segment is more likely a stray line than a plot; mean lines
         # in one panel are drawn at one width
         if len(bars) < 2:
@@ -1492,7 +1917,10 @@ class FigureExtractor:
         w = mean_line["x2"] - mean_line["x1"] + 1
         y = int(mean_line["y0"]) - 1                 # just above the (possibly thick) mean line
         # pick the whisker column (it may sit a pixel or two off centre)
-        col = max(range(cx - 2, cx + 3), key=lambda c: ink[max(plot_top, y - 6): y, c].sum())
+        cols = range(max(0, cx - 2), min(ink.shape[1], cx + 3))
+        if not cols:
+            return None
+        col = max(cols, key=lambda c: ink[max(plot_top, y - 6): y, c].sum())
         def run_width(yy):
             l = r = col
             while l > 0 and ink[yy, l - 1] and col - l <= 20:
@@ -1549,9 +1977,9 @@ class FigureExtractor:
         while yy < stop:
             row = ink[yy]
             l = r = col
-            while l > col - w and row[l - 1]:
+            while l > max(col - w, 0) and row[l - 1]:
                 l -= 1
-            while r < col + w and row[r + 1]:
+            while r < min(col + w, row.size - 1) and row[r + 1]:
                 r += 1
             length = r - l + 1
             if 0.15 * w <= length <= 1.2 * w and abs((l + r) / 2 - col) <= max(2, 0.15 * w):
@@ -1620,6 +2048,22 @@ class FigureExtractor:
                     col=best_col, dark=dark)
         if best_col is None:
             return info
+        # In lightly coloured whiskers, thresholding makes the stem several
+        # pixels wide. Without a local stem-width check it joins the cap into
+        # one tall band, which is discarded as too thick.
+        stem_lengths = []
+        span = bar_top_y - best_end
+        if span > 2 * line_w + 4:
+            for y in range(best_end + int(0.35 * span), best_end + int(0.8 * span) + 1):
+                if not dark[y, best_col]:
+                    continue
+                l = r = best_col
+                while l > max(x1 - 2, 0) and dark[y, l - 1]:
+                    l -= 1
+                while r < min(x2 + 2, dark.shape[1] - 1) and dark[y, r + 1]:
+                    r += 1
+                stem_lengths.append(r - l + 1)
+        min_cap_length = max(0.12 * w, float(np.median(stem_lengths)) + 2) if stem_lengths else 0.12 * w
         rows = []
         for y in range(best_end, bar_top_y + 1):
             row = dark[y]
@@ -1630,7 +2074,7 @@ class FigureExtractor:
                 r += 1
             length = r - l + 1
             symmetric = abs((l + r) / 2 - best_col) <= max(2, 0.06 * w)
-            if 0.12 * w <= length <= 0.9 * w and symmetric:
+            if min_cap_length <= length <= 0.9 * w and symmetric:
                 rows.append((y, length, l, r))
         # merge consecutive rows into bands
         bands = []
@@ -1713,6 +2157,17 @@ class FigureExtractor:
                         b.cap_px = float(np.mean(band))
                 b.uncertain = True
             del b._caps
+        # If nearly all groups show a clear whisker, a cap touching one bar's
+        # outline is more likely a missed coloured cap than an exact zero
+        # error. Keep its value for review but do not present it as confirmed.
+        spans = [abs(b.top_px - b.cap_px) for b in bars
+                 if b.cap_px is not None and not b.uncertain and abs(b.top_px - b.cap_px) > line_w + 1]
+        if len(spans) >= max(2, len(bars) // 2):
+            typical = float(np.median(spans))
+            if typical > 3 * line_w:
+                for b in bars:
+                    if b.cap_px is not None and not b.uncertain and abs(b.top_px - b.cap_px) < max(line_w + 1, 0.2 * typical):
+                        b.uncertain = True
 
     # ---- labels ---------------------------------------------------------- #
 

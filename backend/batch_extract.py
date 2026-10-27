@@ -33,14 +33,23 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 def iter_inputs(paths: Iterable[str]) -> List[str]:
     files = []
+    seen = set()
     for p in paths:
         if os.path.isdir(p):
-            for root, _, names in os.walk(p):
+            for root, dirs, names in os.walk(p):
+                dirs.sort()
                 for n in sorted(names):
                     if os.path.splitext(n)[1].lower() in IMAGE_EXTS | {".pdf"}:
-                        files.append(os.path.join(root, n))
+                        path = os.path.join(root, n)
+                        key = os.path.normcase(os.path.realpath(path))
+                        if key not in seen:
+                            files.append(path)
+                            seen.add(key)
         elif os.path.isfile(p):
-            files.append(p)
+            key = os.path.normcase(os.path.realpath(p))
+            if key not in seen:
+                files.append(p)
+                seen.add(key)
     return files
 
 
@@ -108,7 +117,7 @@ def run(paths: Iterable[str], out_path: str, review_dir: Optional[str] = None,
     return results
 
 
-CHART_NAMES = {"bar": "bar charts or dot plots", "box": "box plots", "violin": "violin plots",
+CHART_NAMES = {"bar": "bar charts or dot plots", "dot": "mean-and-whisker dot plots", "box": "box plots", "violin": "violin plots",
                "line": "line plots"}
 
 

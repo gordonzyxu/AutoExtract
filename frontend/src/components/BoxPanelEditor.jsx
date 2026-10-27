@@ -190,7 +190,8 @@ const BoxPanelEditor = ({ figure, panel, onChange }) => {
                     <div className="col-xl-7 col-lg-6">
                         <div className="d-flex flex-wrap gap-3 mb-2">
                             {choice(`wh-${figure.id}-${panel.axis_x}`, isViolin ? 'Violin ends' : 'Whiskers',
-                                panel.whisker_type || 'minmax', isViolin ? VIOLIN_ENDS : WHISKER_TYPES, 'whisker_type')}
+                                panel.whisker_type || 'unknown',
+                                isViolin ? VIOLIN_ENDS : WHISKER_TYPES, 'whisker_type')}
                             {choice(`mm-${figure.id}-${panel.axis_x}`, 'Mean', panel.mean_method || 'luo', MEAN_METHODS, 'mean_method')}
                             {choice(`sm-${figure.id}-${panel.axis_x}`, 'SD', panel.sd_method || 'shi', SD_METHODS, 'sd_method')}
                         </div>
@@ -200,11 +201,11 @@ const BoxPanelEditor = ({ figure, panel, onChange }) => {
                                     <tr>
                                         <th style={{ width: 28 }}>#</th>
                                         <th>treatment_group</th>
-                                        <th className={`text-end ${usesRange ? '' : 'text-muted'}`}>min</th>
+                                        <th className={`text-end ${usesRange ? '' : 'text-muted'}`}>{usesRange ? 'min' : 'lower end'}</th>
                                         <th className="text-end">Q1</th>
                                         <th className="text-end">median</th>
                                         <th className="text-end">Q3</th>
-                                        <th className={`text-end ${usesRange ? '' : 'text-muted'}`}>max</th>
+                                        <th className={`text-end ${usesRange ? '' : 'text-muted'}`}>{usesRange ? 'max' : 'upper end'}</th>
                                         <th style={{ width: 76 }}>n</th>
                                         <th className="text-end">mean*</th>
                                         <th className="text-end">sd*</th>
@@ -254,9 +255,10 @@ const BoxPanelEditor = ({ figure, panel, onChange }) => {
                             <button className="btn btn-sm btn-outline-secondary" onClick={applyN} disabled={!nAll}>Apply</button>
                         </div>
                         <div className="small text-muted mt-2">
-                            * Estimated from {medianOnly ? 'min, median, max (only the median is drawn)'
+                            * Estimated from {medianOnly && !usesRange ? 'a drawn median once the ends are confirmed as data min–max'
+                                : medianOnly ? 'min, median, max (only the median is drawn)'
                                 : usesRange ? 'min, Q1, median, Q3, max'
-                                    : `Q1, median, Q3 (${isViolin ? 'the ends' : 'whiskers'} are not the range)`} and n.
+                                    : `Q1, median, Q3 (${isViolin ? 'ends' : 'whiskers'} are not used without confirmed range semantics)`} and n.
                             {skewed > 0 && ` ${skewed} skewed box${skewed > 1 ? 'es' : ''}: estimates may be biased.`}
                         </div>
                         {panel.warnings?.length > 0 && (

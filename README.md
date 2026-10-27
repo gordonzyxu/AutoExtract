@@ -2,7 +2,7 @@
 
 A web app that extracts data from charts in scientific papers: bar charts, dot plots, box plots, violin plots and line plots. Drop in whole PDFs: every chart of the page's type is found, its axes calibrated from the tick labels, and each group's mean and error bar (or min, quartiles, median and max; or each line point and its error bar) measured from the pixels. Box and violin plots also get an estimated mean and SD for meta-analysis. Results go to one Excel workbook laid out like a meta-analysis long-format sheet, ready to paste.
 
-Built on [AutoExtract](https://github.com/MohanYang03/AutoExtract) by Mohan Yang; its Bar, Box and Line Analyzer pages are now batch extractors (plus a new Violin Analyzer), and its YOLO-based single-image analysis remains available as an API endpoint. The backend runs on Flask; the frontend is a Vite + React app.
+Built on [AutoExtract](https://github.com/MohanYang03/AutoExtract) by Mohan Yang; its Bar, Box and Line Analyzer pages are now batch extractors (plus new Dot Plot and Violin Analyzers), and its YOLO-based single-image analysis remains available as an API endpoint. The backend runs on Flask; the frontend is a Vite + React app.
 
 ## Setup (once)
 
@@ -81,6 +81,7 @@ Open **http://localhost:2800/bar_analyzer**. The image includes the built page a
 There is one page per chart type, and each takes whole papers, several at once:
 
 - **Bar Analyzer** (`/bar_analyzer`): bar charts and dot plots (mean ± error bar).
+- **Dot Plot Analyzer** (`/dot_analyzer`): mean-and-whisker dot plots on a dedicated page.
 - **Box Analyzer** (`/box_analyzer`): box plots.
 - **Violin Analyzer** (`/violin_analyzer`): violin plots.
 - **Line Analyzer** (`/line_analyzer`): line plots (one row per point of each series).
@@ -97,7 +98,7 @@ Papers mix chart types, so each page leaves the other kinds out: drop the same P
 
 ### Box Analyzer
 
-Each box shows min, Q1, median, Q3 and max; drag any of those lines to correct it. Per panel, choose:
+Each box shows its lower whisker end, Q1, median, Q3 and upper whisker end; drag any of those lines to correct it. The ends are sample min and max only when the whiskers show the full range. Per panel, choose:
 
 - **Whiskers**: *Min–max* (whiskers are the range), *1.5×IQR* (Tukey), *Percentile* or *Not stated*. Only min–max whiskers are used as the range; otherwise only the quartiles are used.
 - **Mean**: Luo 2018 (recommended), Wan 2014 or Hozo 2005. **SD**: Shi 2020 (recommended), Wan 2014 or Hozo 2005.
@@ -106,11 +107,11 @@ Type **n** per box (or the same n for every box); the estimated mean and SD appe
 
 ### Violin Analyzer
 
-Works like the Box Analyzer. Each violin gives its ends (min and max: Prism's "truncated" and ggplot's `trim = TRUE` violins end at the data range, the default in both) and the median and quartiles from the lines drawn inside it (Prism: dashed median, dotted quartiles) or from a narrow box plot drawn inside it (ggplot). When only the median is drawn, the estimate uses min, median and max (Luo 2018 / Wan 2014, scenario C1). Set **Violin ends** to *Not the range* when the tails run past the data.
+Works like the Box Analyzer. Each violin gives its visible ends and the median and quartiles from lines drawn inside it or a narrow inner box. Violin ends are **not confirmed as the sample range** by default: some plotting software extends the smoothed density beyond the observations. If the figure or caption confirms that the violin is trimmed to the data range, set **Violin ends** to *Data min–max*. When only the median is drawn, a mean/SD estimate requires both a confirmed range and `n`.
 
 ### Line Analyzer
 
-Each series is traced by its colour (several series of one colour are traced one after another). Its markers are the data points, read where the line segments on either side meet (so a marker partly covered by another series still reads true), each with its error bar; the x value comes from the x-axis labels. A marker hidden under another series' marker is read from its line and flagged. Name each series once (it becomes `treatment_group` for all its points); set SEM/SD and n as on the Bar Analyzer. Lines without markers are read at the x ticks.
+Each series is traced by its colour (several series of one colour are traced one after another). Its markers are the data points, read where the line segments on either side meet (so a marker partly covered by another series still reads true), each with its error bar; the x value comes from the x-axis labels. A marker hidden under another series' marker is read from its line and flagged. When a panel has error bars, any point whose error bar could not be measured is flagged for review rather than reported as zero error. Name each series once (it becomes `treatment_group` for all its points); set SEM/SD and n as on the Bar Analyzer. Lines without markers are read at the x ticks.
 
 Bar Analyzer options (numbers are always extracted; the Box Analyzer has the first two):
 
@@ -129,13 +130,13 @@ Each panel gets a sheet whose first 12 columns are:
 
 The measured error goes in `sem` (or `sd`, with the last column named `mean+sd`); the other is a live formula on `sample_size`. `paper_id` is filled from folder names like `(paper11) ...`. An **All data** sheet stacks every panel with source/figure/panel columns, and **Summary** lists each panel with how many tick labels were used and how many values need a check.
 
-Box- and violin-plot sheets fill `mean` and `sd` with live formulas that estimate them from the min/Q1/median/Q3/max columns (written to the right) and `sample_size`, using the panel's chosen methods; `sem` is `sd/√n`. They fill in as soon as n is typed. Line-plot sheets have one row per point, with `series` and `x` columns after the 12.
+Box- and violin-plot sheets include lower end/Q1/median/Q3/upper end columns to the right of the long-format columns. Live formulas estimate `mean` and `sd` from the usable statistics and `sample_size`; `sem` is `sd/√n`. The end values enter the estimate only when confirmed as the sample range. Line-plot sheets have one row per point, with `series` and `x` columns after the 12.
 
 ### Command line
 
 ```bash
 python backend/batch_extract.py "path/to/papers" --out results.xlsx --review review_images/
-python backend/batch_extract.py "path/to/papers" --type box --out box_plots.xlsx   # or --type violin / line
+python backend/batch_extract.py "path/to/papers" --type box --out box_plots.xlsx   # or --type dot / violin / line
 # options: --no-names  --no-titles  --legend  --error-type sem|sd
 ```
 
@@ -151,18 +152,25 @@ python backend/batch_extract.py "path/to/papers" --type box --out box_plots.xlsx
 
 ### Accuracy
 
-Measured against hand-digitized meta-analysis spreadsheets (21 papers, 98 sheets) and against synthetic charts with known values:
+Full definitions, numbers and how to rerun them are in [eval/BENCHMARKS.md](eval/BENCHMARKS.md) and [eval/PAPER_VALIDATION.md](eval/PAPER_VALIDATION.md). In short (October 2026):
 
-- Paper 11 (30 bars): mean error **0.23 %** of the axis range, all means within 1 %; caps 0.6 %.
-- 21 papers: 95 of 98 sheets matched; median error **0.40 %** (means) and **0.32 %** (caps).
-- 200 random synthetic charts: 97 % measured exactly right (every mean within 1 %), and every *unflagged* error bar within 1 %.
-- A whole paper (27 panels) extracts in about 5 s on a laptop CPU.
+- **Your meta-analysis papers** (8 hand-mapped figures vs the WebPlotDigitizer sheets): **91/92** bar means and **85/92** bar error bars within 1 % of the axis range (the other 7 error bars are flagged for review), and **2/4** line means. No box or violin figure is mapped yet.
+- **Real published figures** ([CHART-Info 2022](https://chartinfo.github.io/toolsanddata.html), misses count as failures): **41 %** of all annotated bar values, **60–62 %** of box quartiles and medians, and **26 %** of line-trace positions are recovered within 1 %. Among values the tool does find, 86 % (bars), 90–94 % (box quartiles) and 63 % (lines) are within 1 %. Coverage, not precision, is the main limit.
+- **Synthetic charts with known values** (40 per type, held-out seed, every group or point must be found and within 1 %):
 
-- Random synthetic charts with exact values (share with every value within 1 % of the axis): bar charts 97–99 %, box plots 92–95 %, violin plots 71–75 %, line plots 60–66 % (typical point error 0.09 %).
-- Real charts from PubMed Central ([CHART-Info 2022](https://chartinfo.github.io/) test set, hand-annotated), share within 1 % of the axis: bar values 78 %; box Q1/median/Q3 88–91 % (whisker ends 77 %); line points 59 %. Many misses are charts whose axis labels cannot be read at all.
-- Each page on the other chart types (CHART-Info): the box and violin pages report nothing on 280 bar charts; at most 7 % of other charts give a stray panel on any page.
+| Chart type | Normal image | Resized JPEG |
+| --- | ---: | ---: |
+| Bar | 40/40 | 36/40 |
+| Dot | 38/40 | 36/40 |
+| Box | 40/40 | 38/40 |
+| Violin | 32/40 | 31/40 |
+| Line | 32/40 | 18/40 |
 
-The original two-label YOLO pipeline scored 17 % mean error on the same 30 bars.
+Values flagged for review (`uncertain`) are not counted as correct; check them before using them. Line plots, especially small or compressed ones, need the most checking.
+
+Earlier project runs (not repeated in the October 2026 audit) reported 95 of 98 sheets matched across 21 papers, with median error 0.40 % for means and 0.32 % for caps.
+
+In an earlier run on one paper's 30 bars, this extractor's mean error was 0.23 % of the axis range; the original two-label YOLO pipeline scored 17 %.
 
 ## Tests and benchmarks
 
@@ -170,7 +178,7 @@ The original two-label YOLO pipeline scored 17 % mean error on the same 30 bars.
 .venv/bin/python -m pip install -r requirements-dev.txt   # Windows: .venv\Scripts\python
 # run the commands below with the same .venv python
 python -m pytest tests -q                 # synthetic accuracy + API tests
-python tests/fuzz.py 200                  # randomised stress test (--box / --violin / --line for those)
+python tests/fuzz.py 40 --seed 31337      # randomised stress test (--bar-only / --dot / --box / --violin / --line)
 python tests/ui_check.py                  # headless browser check (app must be running)
 python eval/run_eval.py --data "path/to/mice studies"   # vs hand-digitized sheets
 python eval/sweep.py --data "path/to/mice studies"      # every paper in the folder
@@ -180,7 +188,7 @@ python eval/chartinfo_eval.py --data path/to/ICPR2022_CHARTINFO_UB_UNITEC_PMC_TE
 
 ## API Overview
 
-- POST `/api/extract`: multipart `file` (PDF or image), optional `options` (JSON: `chart_type` `bar`|`box`|`violin`|`line` (default `bar`), `bar_names`, `titles`, `legend_colors`), `error_type` (`sem`/`sd`) and `job`. Returns every panel found with its calibration, `kind` (`bar`, `dot`, `box`, `violin` or `line`), bars (`mean`, `mean_plus_err`, pixel positions, `uncertain` flag), boxes (`lo`, `q1`, `median`, `q3`, `hi`, outliers, pixel positions; violins too) or series (`color`, `label`, `trace`, `points` with `x`, `mean`, `mean_plus_err`) and a figure image URL.
+- POST `/api/extract`: multipart `file` (PDF or image), optional `options` (JSON: `chart_type` `bar`|`dot`|`box`|`violin`|`line` (default `bar`), `bar_names`, `titles`, `legend_colors`), `error_type` (`sem`/`sd`) and `job`. Returns every panel found with its calibration, `kind` (`bar`, `dot`, `box`, `violin` or `line`), bars (`mean`, `mean_plus_err`, pixel positions, `uncertain` flag), boxes (`lo`, `q1`, `median`, `q3`, `hi`, outliers, pixel positions; violins too) or series (`color`, `label`, `trace`, `points` with `x`, `mean`, `mean_plus_err`) and a figure image URL.
 - POST `/api/export`: JSON `{figures: [...]}` (as returned, possibly edited). Returns the `.xlsx` workbook.
 - POST `/api/bar_analyzer`: classic single-image YOLO analysis (multipart `file`).
 - POST `/api/update_values`: JSON `{ "origin_value": number|string, "ymax_value": number|string }`

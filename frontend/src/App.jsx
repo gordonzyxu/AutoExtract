@@ -80,11 +80,12 @@ const HomePage = () => (
       <div className="row g-4">
         {[
           { icon: 'bi-graph-up-arrow', title: 'Bar Graph Analysis', desc: 'Drop in whole papers: every bar chart and dot plot is measured (means and error bars) and exported in long format.', link: '/bar_analyzer' },
+          { icon: 'bi-circle', title: 'Dot Plot Analysis', desc: 'Measure mean-and-whisker dot groups and their error bars from papers and figure images.', link: '/dot_analyzer' },
           { icon: 'bi-box', title: 'Box Plot Analysis', desc: 'Read min, quartiles, median and max from box plots and estimate mean and SD for meta-analysis (Luo, Shi, Wan, Hozo).', link: '/box_analyzer' },
           { icon: 'bi-vinyl', title: 'Violin Plot Analysis', desc: 'Read the ends, quartile and median lines (or an inner box plot) of violin plots and estimate mean and SD.', link: '/violin_analyzer' },
           { icon: 'bi-graph-up', title: 'Line Graph Analysis', desc: 'Trace each series of a line plot: every point with its error bar, and the x value from the axis.', link: '/line_analyzer' }
         ].map((feature, i) => (
-          <div key={i} className="col-lg-3 col-md-6">
+            <div key={i} className="col-xl col-md-6">
             <div className="card border-0 shadow-sm h-100">
               <div className="card-body text-center">
                 <div className="feature-icon-compact mb-3">
@@ -729,7 +730,7 @@ const TutorialPage = () => {
 // One page per chart type. Both stay mounted once visited, so dropped papers
 // and edits are kept while you switch pages; only the current one is shown.
 const ANALYZER_PATHS = {
-  '/bar_analyzer': 'bar', '/box_analyzer': 'box', '/violin_analyzer': 'violin', '/line_analyzer': 'line',
+  '/bar_analyzer': 'bar', '/dot_analyzer': 'dot', '/box_analyzer': 'box', '/violin_analyzer': 'violin', '/line_analyzer': 'line',
 };
 
 const AnalyzerPages = () => {
@@ -737,7 +738,7 @@ const AnalyzerPages = () => {
   const current = ANALYZER_PATHS[pathname.replace(/\/+$/, '')];
   const [visited, setVisited] = useState({});
   if (current && !visited[current]) setVisited((v) => ({ ...v, [current]: true }));
-  return ['bar', 'box', 'violin', 'line'].map((mode) => (visited[mode] || current === mode) && (
+  return ['bar', 'dot', 'box', 'violin', 'line'].map((mode) => (visited[mode] || current === mode) && (
     <div key={mode} style={{ display: current === mode ? 'block' : 'none' }}>
       <BatchExtractor mode={mode} />
     </div>
@@ -760,6 +761,7 @@ function App() {
               <li className="nav-item"><Link className="nav-link" to="/">Home</Link></li>
               <li className="nav-item"><Link className="nav-link" to="/tutorial">Tutorial</Link></li>
               <li className="nav-item"><Link className="nav-link" to="/bar_analyzer">Bar Analyzer</Link></li>
+              <li className="nav-item"><Link className="nav-link" to="/dot_analyzer">Dot Analyzer</Link></li>
               <li className="nav-item"><Link className="nav-link" to="/box_analyzer">Box Analyzer</Link></li>
               <li className="nav-item"><Link className="nav-link" to="/violin_analyzer">Violin Analyzer</Link></li>
               <li className="nav-item"><Link className="nav-link" to="/line_analyzer">Line Analyzer</Link></li>
@@ -773,6 +775,7 @@ function App() {
         <Routes>
           {/* the analyzer pages are rendered below so their results survive navigation */}
           <Route path="/bar_analyzer" element={null} />
+          <Route path="/dot_analyzer" element={null} />
           <Route path="/box_analyzer" element={null} />
           <Route path="/violin_analyzer" element={null} />
           <Route path="/line_analyzer" element={null} />
